@@ -2,7 +2,7 @@
 
 > Playlist simulation for the SnowSky Echo Mini.
 
-The Echo Mini does not offer the playlist experience many users expect because the SoC is incompatible with `.m3u` files. EchoList provides a simple way to build playlists, organize tracks, and sync them to your device.
+The Echo Mini does not offer the playlist experience many users expect because the SoC is incompatible with `.m3u` files. EchoList provides a simple way to build playlists, organize tracks, and syn[...]
 
 With EchoList, songs can belong to multiple playlists while keeping your albums and library structure clean.
 
@@ -111,7 +111,7 @@ If you test EchoList on devices other than the Echo Mini, feel free to share you
 
 Pre-built binaries for Windows, Linux, and macOS are available on the [Releases](https://github.com/purpleturtle21/echo-mini-sync/releases) page.
 
-**macOS (untested):** Download `echolist-macos-arm64` (Apple Silicon). macOS has not been tested — it may work but is not guaranteed. Apple will block the app because it is not signed. To open it, run:
+**macOS (untested):** Download `echolist-macos-arm64` (Apple Silicon). macOS has not been tested — it may work but is not guaranteed. Apple will block the app because it is not signed. To open [...]
 ```bash
 xattr -cr echolist-macos-arm64
 chmod +x echolist-macos-arm64
@@ -122,4 +122,6 @@ chmod +x echolist-macos-arm64
 
 ## License
 
-MIT License
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0). See the LICENSE file for details.
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
