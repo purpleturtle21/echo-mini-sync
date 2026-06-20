@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .safe_write import SafeWriter
 
+from .safe_write import atomic_write_text as _atomic_write_text
+
 CONFIG_REL = ".echolist/config.json"
 DEFAULT_FILE = Path.home() / ".echolist" / "default.json"
 BACKUPS_ROOT = Path.home() / ".echolist" / "backups"
@@ -31,11 +33,10 @@ def load_defaults() -> dict:
 
 
 def save_defaults(source: str, dest: str) -> None:
-    DEFAULT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DEFAULT_FILE.write_text(json.dumps({
+    _atomic_write_text(DEFAULT_FILE, json.dumps({
         "source": str(Path(source).resolve()),
         "dest": str(Path(dest).resolve()),
-    }), encoding="utf-8")
+    }))
 
 
 # ── Metadata backups (stored in ~/.echolist/backups/) ──
@@ -45,7 +46,7 @@ def save_backup(workspace_root: str | Path, pid: str, timestamp: str, data: dict
     backup_dir = BACKUPS_ROOT / wid / pid
     backup_dir.mkdir(parents=True, exist_ok=True)
     p = backup_dir / f"{timestamp}.json"
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _atomic_write_text(p, json.dumps(data, indent=2))
     return p
 
 
@@ -81,7 +82,15 @@ def load_backup(workspace_root: str | Path, pid: str, timestamp: str) -> dict | 
     p = BACKUPS_ROOT / wid / pid / f"{timestamp}.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict) or "tracks" not in data:
+        return None
+    if not isinstance(data["tracks"], list):
+        return None
+    return data
 
 
 # ── Playlist snapshot (full playlist structure backup) ──
@@ -91,10 +100,10 @@ def save_playlist_snapshot(workspace_root: str | Path, config_data: dict, store_
     snapshot_dir = BACKUPS_ROOT / wid
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     p = snapshot_dir / "snapshot.json"
-    p.write_text(json.dumps({
+    _atomic_write_text(p, json.dumps({
         "config": config_data,
         "store": store_data,
-    }, indent=2), encoding="utf-8")
+    }, indent=2))
     return p
 
 
@@ -103,7 +112,18 @@ def load_playlist_snapshot(workspace_root: str | Path) -> dict | None:
     p = BACKUPS_ROOT / wid / "snapshot.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "config" not in data or "store" not in data:
+        return None
+    return data
+
+
+DEFAULT_PLAYLIST_FOLDER = "Playlists"
 
 
 @dataclass
@@ -113,6 +133,9 @@ class Config:
     node_name: str = "* PLAYLISTS *"
     album_prefix: str = ""
     star_prefix: bool = False
+    playlist_folder: str = DEFAULT_PLAYLIST_FOLDER
+    backup_interval: int = 5
+    _sync_count: int = 0
 
     @classmethod
     def load(cls, writer: SafeWriter) -> Config:
@@ -125,8 +148,18 @@ class Config:
                 node_name=data.get("node_name", "* PLAYLISTS *"),
                 album_prefix=data.get("album_prefix", ""),
                 star_prefix=data.get("star_prefix", False),
+                playlist_folder=data.get("playlist_folder", DEFAULT_PLAYLIST_FOLDER),
+                backup_interval=data.get("backup_interval", 5),
+                _sync_count=data.get("_sync_count", 0),
             )
         return cls()
 
     def save(self, writer: SafeWriter) -> None:
         writer.write_text(CONFIG_REL, json.dumps(asdict(self), indent=2))
+
+    def should_backup(self) -> bool:
+        return self._sync_count % self.backup_interval == 0
+
+    def increment_sync(self, writer: SafeWriter) -> None:
+        self._sync_count += 1
+        self.save(writer)

@@ -53,7 +53,8 @@ def dest(tmp_path):
 @pytest.fixture
 def manager(source, dest):
     mgr = PlaylistManager.init(source, dest)
-    return mgr
+    yield mgr
+    mgr.release_lock()
 
 
 def _hash_file(p: Path) -> str:

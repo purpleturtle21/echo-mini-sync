@@ -13,9 +13,13 @@ import platform
 import string
 from datetime import datetime
 
-from .manager import PlaylistManager, AUDIO_EXTS
+from .manager import PlaylistManager, WorkspaceLockError, AUDIO_EXTS
 from .naming import playlist_id, sanitize
-from .config import load_defaults, save_defaults
+from .config import load_defaults, save_defaults, DEFAULT_PLAYLIST_FOLDER
+from .journal import SyncJournal
+from .m3u import parse_m3u, curate_playlist_name
+
+M3U_EXTS = frozenset({".m3u", ".m3u8"})
 
 
 def _detect_echo_mini() -> str | None:
@@ -114,6 +118,17 @@ def _format_backup_timestamp(ts: str) -> str:
         return ts
 
 
+def _cleanup_temp_files(workspace_root: Path) -> None:
+    """Remove _echolist_tmp_* files left by interrupted reorders."""
+    if not workspace_root.exists():
+        return
+    for f in workspace_root.rglob("_echolist_tmp_*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
 class StagingState:
     """Tracks pending add/remove operations before SYNC."""
 
@@ -134,12 +149,12 @@ class StagingState:
                 pass
 
     def save(self):
-        PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PENDING_FILE.write_text(json.dumps({
+        from .safe_write import atomic_write_text
+        atomic_write_text(PENDING_FILE, json.dumps({
             "adds": self.pending_adds,
             "removes": self.pending_removes,
             "reorders": self.pending_reorders,
-        }, indent=2), encoding="utf-8")
+        }, indent=2))
 
     def clear(self):
         self.pending_adds.clear()
@@ -246,6 +261,7 @@ class App:
         self._cached_workspace_bytes = 0
         self._stats_pending = False
         self._alive = True
+        self._syncing = False
         self._apply_theme()
         self._show_setup()
 
@@ -343,11 +359,11 @@ class App:
         self._setup_btn_frame = ttk.Frame(frame)
         self._setup_btn_frame.pack(pady=(5, 10))
 
-        adv_lbl = tk.Label(frame, text="Advanced setup...",
+        adv_lbl = tk.Label(frame, text="Settings...",
                             font=("Consolas", 9, "underline"),
                             bg=BG, fg=FG_DIM, cursor="hand2")
         adv_lbl.pack(pady=(10, 0))
-        adv_lbl.bind("<Button-1>", lambda e: self._show_advanced_setup())
+        adv_lbl.bind("<Button-1>", lambda e: self._show_settings())
 
         self.root.after(200, self._detect_and_show)
 
@@ -396,76 +412,184 @@ class App:
         if browse_device:
             self._populate_source_tree(Path(dest))
 
-    def _show_advanced_setup(self):
+    def _show_settings(self):
+        """Unified settings screen — used both for initial setup and in-app config."""
         for w in self.root.winfo_children():
             w.destroy()
         self.root.config(menu=tk.Menu(self.root))
-        self._center_window(420, 280)
+        self._center_window(460, 440)
 
-        frame = ttk.Frame(self.root, padding=20)
-        frame.pack(fill="both", expand=True)
+        is_open = self.mgr is not None
 
-        ttk.Label(frame, text="ECHOLIST", style="Title.TLabel").grid(
-            row=0, column=0, columnspan=3, pady=(0, 15))
+        outer = ttk.Frame(self.root, padding=20)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="SETTINGS", style="Title.TLabel").pack(pady=(0, 15))
+
+        frame = ttk.Frame(outer)
+        frame.pack(fill="x")
+        frame.columnconfigure(1, weight=1)
 
         defaults = load_defaults()
         cwd = str(Path.cwd())
 
-        default_source = defaults.get("source", cwd)
-        default_dest = defaults.get("dest", cwd)
+        cur_source = self.source or defaults.get("source", cwd)
+        cur_dest = self.dest or defaults.get("dest", cwd)
+        existing_config = self._load_existing_config(cur_dest) if not is_open else {}
 
-        ttk.Label(frame, text="SOURCE").grid(row=1, column=0, sticky="w", pady=4)
-        self._source_var = tk.StringVar(value=default_source)
-        ttk.Entry(frame, textvariable=self._source_var, width=35).grid(
-            row=1, column=1, padx=5, pady=4)
-        ttk.Button(frame, text="...", width=3,
-                    command=lambda: self._browse_var(self._source_var)).grid(row=1, column=2)
+        row = 0
 
-        ttk.Label(frame, text="DEST").grid(row=2, column=0, sticky="w", pady=4)
-        self._dest_var = tk.StringVar(value=default_dest)
-        ttk.Entry(frame, textvariable=self._dest_var, width=35).grid(
-            row=2, column=1, padx=5, pady=4)
-        ttk.Button(frame, text="...", width=3,
-                    command=lambda: self._browse_var(self._dest_var)).grid(row=2, column=2)
+        # ── Source ──
+        ttk.Label(frame, text="SOURCE").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        self._source_var = tk.StringVar(value=cur_source)
+        src_row = ttk.Frame(frame)
+        src_row.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5, pady=(4, 0))
+        ttk.Entry(src_row, textvariable=self._source_var, width=32).pack(side="left", fill="x", expand=True)
+        ttk.Button(src_row, text="...", width=3,
+                    command=lambda: self._browse_var(self._source_var)).pack(side="left", padx=(4, 0))
+        row += 1
+        tk.Label(frame, text="Your music library — files are copied from here, never modified",
+                 font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 6))
+        row += 1
 
-        btn_row = ttk.Frame(frame)
-        btn_row.grid(row=3, column=0, columnspan=3, pady=(20, 0))
-        ttk.Button(btn_row, text="Back",
-                    command=self._show_setup).pack(side="left", padx=5)
+        # ── Dest ──
+        ttk.Label(frame, text="DEST").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        self._dest_var = tk.StringVar(value=cur_dest)
+        dest_row = ttk.Frame(frame)
+        dest_row.grid(row=row, column=1, columnspan=2, sticky="ew", padx=5, pady=(4, 0))
+        ttk.Entry(dest_row, textvariable=self._dest_var, width=32).pack(side="left", fill="x", expand=True)
+        ttk.Button(dest_row, text="...", width=3,
+                    command=lambda: self._browse_var(self._dest_var)).pack(side="left", padx=(4, 0))
+        row += 1
+        tk.Label(frame, text="Device or folder where playlists are stored",
+                 font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 6))
+        row += 1
+
+        # ── Separator ──
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=8)
+        row += 1
+
+        # ── Playlist folder ──
+        ttk.Label(frame, text="FOLDER").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        default_folder = (self.mgr.config.playlist_folder if is_open
+                          else existing_config.get("playlist_folder", DEFAULT_PLAYLIST_FOLDER))
+        self._folder_var = tk.StringVar(value=default_folder)
+        ttk.Entry(frame, textvariable=self._folder_var, width=20).grid(
+            row=row, column=1, sticky="w", padx=5, pady=(4, 0))
+        row += 1
+        tk.Label(frame, text="Root folder name on the device (default: Playlists)",
+                 font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 6))
+        row += 1
+
+        # ── Backup interval ──
+        ttk.Label(frame, text="BACKUP EVERY").grid(row=row, column=0, sticky="w", pady=(4, 0))
+        default_interval = (str(self.mgr.config.backup_interval) if is_open
+                            else str(existing_config.get("backup_interval", 5)))
+        self._backup_var = tk.StringVar(value=default_interval)
+        backup_frame = ttk.Frame(frame)
+        backup_frame.grid(row=row, column=1, sticky="w", padx=5, pady=(4, 0))
+        vcmd = (frame.register(lambda v: v.isdigit() or v == ""), "%P")
+        ttk.Entry(backup_frame, textvariable=self._backup_var, width=5,
+                  validate="key", validatecommand=vcmd).pack(side="left")
+        ttk.Label(backup_frame, text=" syncs").pack(side="left")
+        row += 1
+        tk.Label(frame, text="How often to create automatic restore points (1 = every sync)",
+                 font=("Consolas", 8), bg=BG, fg=FG_DIM, anchor="w").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=(0, 5), pady=(0, 6))
+        row += 1
+
+        # ── Buttons (centered) ──
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(pady=(15, 0))
+        if is_open:
+            ttk.Button(btn_row, text="Cancel",
+                        command=self._show_main).pack(side="left", padx=5)
+        else:
+            ttk.Button(btn_row, text="Back",
+                        command=self._show_setup).pack(side="left", padx=5)
         ttk.Button(btn_row, text="[ OPEN ]", style="Accent.TButton",
-                    command=self._on_advanced_open).pack(side="left", padx=5)
-        self.root.bind("<Return>", lambda e: self._on_advanced_open())
+                    command=self._on_settings_open).pack(side="left", padx=5)
+        self.root.bind("<Return>", lambda e: self._on_settings_open())
+
+    def _load_existing_config(self, dest: str) -> dict:
+        """Try to read config from an existing workspace to pre-populate settings."""
+        for folder in (DEFAULT_PLAYLIST_FOLDER, "Music", "Playlists"):
+            config_path = Path(dest) / folder / ".echolist" / "config.json"
+            if config_path.exists():
+                try:
+                    import json as _json
+                    return _json.loads(config_path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+        return {}
 
     def _browse_var(self, var):
         d = filedialog.askdirectory(initialdir=var.get())
         if d:
             var.set(d)
 
-    def _on_advanced_open(self):
+    def _on_settings_open(self):
         source = self._source_var.get().strip()
         dest = self._dest_var.get().strip()
         if not source or not dest:
             messagebox.showwarning("Missing paths",
                                     "Both source and destination are required.")
             return
-        self._open_workspace(source, dest)
-
-    def _open_workspace(self, source: str, dest: str):
+        folder = self._folder_var.get().strip() or DEFAULT_PLAYLIST_FOLDER
         try:
-            workspace = Path(dest) / "Playlists" / ".echolist" / "config.json"
-            playlists_dir = Path(dest) / "Playlists"
-            is_external = playlists_dir.exists() and not workspace.exists()
-            is_empty = not workspace.exists()
+            interval = max(1, int(self._backup_var.get().strip() or "5"))
+        except ValueError:
+            interval = 5
 
-            if workspace.exists():
-                mgr = PlaylistManager.open(dest)
+        if self.mgr:
+            self.mgr.config.backup_interval = interval
+            if folder != self.mgr.config.playlist_folder:
+                self.mgr.config.playlist_folder = folder
+            self.mgr.config.save(self.mgr.writer)
+
+            new_source = source
+            new_dest = dest
+            if new_source != self.source or new_dest != self.dest:
+                self.mgr.release_lock()
+                self._open_workspace(new_source, new_dest,
+                                     playlist_folder=folder,
+                                     backup_interval=interval)
             else:
-                # Check for a snapshot before initializing
-                snapshot = PlaylistManager.find_snapshot(dest)
+                save_defaults(source, dest)
+                self._show_main()
+        else:
+            self._open_workspace(source, dest,
+                                 playlist_folder=folder,
+                                 backup_interval=interval)
+
+    def _open_workspace(self, source: str, dest: str,
+                        playlist_folder: str = DEFAULT_PLAYLIST_FOLDER,
+                        backup_interval: int = 5):
+        try:
+            playlists_dir = Path(dest) / playlist_folder
+            config_file = playlists_dir / ".echolist" / "config.json"
+            is_external = playlists_dir.exists() and not config_file.exists()
+            is_empty = not config_file.exists()
+
+            if config_file.exists():
+                mgr = PlaylistManager.open(dest, playlist_folder=playlist_folder)
+            else:
+                snapshot = PlaylistManager.find_snapshot(dest, playlist_folder=playlist_folder)
                 if snapshot and self._offer_snapshot_restore(snapshot, source, dest):
                     return
-                mgr = PlaylistManager.init(source, dest)
+                mgr = PlaylistManager.init(
+                    source, dest,
+                    playlist_folder=playlist_folder,
+                    backup_interval=backup_interval,
+                )
             save_defaults(source, dest)
+        except WorkspaceLockError as e:
+            messagebox.showerror("Workspace locked", str(e))
+            return
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
@@ -473,6 +597,23 @@ class App:
         self.source = source
         self.dest = dest
         self.root.unbind("<Return>")
+
+        incomplete = SyncJournal.load_incomplete()
+        if incomplete:
+            pending = incomplete.pending_actions
+            n = len(pending)
+            messagebox.showwarning(
+                "Interrupted sync detected",
+                f"A previous sync was interrupted with {n} operation(s) "
+                f"remaining.\n\n"
+                f"The workspace may be in a partial state. Use the Playlists "
+                f"menu to restore from a backup, or press Refresh (F5) to "
+                f"rescan from the device.",
+            )
+            SyncJournal.discard()
+            _cleanup_temp_files(mgr.writer.root)
+            for pid in list(mgr.store.playlists):
+                mgr.rescan_playlist(pid)
 
         if is_external and is_empty:
             has_audio = any(
@@ -503,7 +644,8 @@ class App:
         snap_config = snapshot.get("config", {})
         snap_source = snap_config.get("source_root", source)
 
-        workspace = Path(dest) / "Playlists"
+        snap_folder = snap_config.get("playlist_folder", DEFAULT_PLAYLIST_FOLDER)
+        workspace = Path(dest) / snap_folder
         total_tracks = sum(len(pl.get("tracks", [])) for pl in playlists.values())
         pl_list = "\n".join(
             f"  - {workspace / pl['folder']}"
@@ -529,6 +671,8 @@ class App:
                 snap_source, dest,
                 node_name=snap_config.get("node_name", "* PLAYLISTS *"),
                 album_prefix=snap_config.get("album_prefix", ""),
+                playlist_folder=snap_folder,
+                backup_interval=snap_config.get("backup_interval", 5),
             )
             save_defaults(snap_source, dest)
         except Exception as e:
@@ -631,6 +775,7 @@ class App:
         pl_header.pack(fill="x", padx=4, pady=(4, 2))
         ttk.Label(pl_header, text="PLAYLISTS", style="Section.TLabel").pack(side="left")
         ttk.Button(pl_header, text="+ New", command=self._create_playlist).pack(side="right", padx=(4, 0))
+        ttk.Button(pl_header, text=".m3u", command=self._import_m3u_dialog).pack(side="right", padx=(4, 0))
         ttk.Button(pl_header, text="Delete", command=self._delete_playlist).pack(side="right")
 
 
@@ -786,8 +931,7 @@ class App:
                             activebackground=RED_DARK, activeforeground=FG_BRIGHT)
         file_menu.add_command(label="Refresh", command=self._refresh_all, accelerator="F5")
         file_menu.add_separator()
-        file_menu.add_command(label="Change workspace...", command=self._show_setup)
-        file_menu.add_command(label="Advanced setup...", command=self._show_advanced_setup)
+        file_menu.add_command(label="Settings...", command=self._show_settings)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         self.root.bind("<F5>", lambda e: self._refresh_all())
@@ -797,6 +941,20 @@ class App:
                                         activebackground=RED_DARK, activeforeground=FG_BRIGHT)
         menubar.add_cascade(label="Playlists", menu=self._playlists_menu)
         self._refresh_playlists_menu()
+
+    def _set_ui_locked(self, locked: bool):
+        state = "disabled" if locked else "!disabled"
+        for w in (self.undo_btn,):
+            try:
+                w.state([state])
+            except Exception:
+                pass
+        if locked:
+            self.playlist_tree.configure(selectmode="none")
+            self.source_tree.configure(selectmode="none")
+        else:
+            self.playlist_tree.configure(selectmode="browse")
+            self.source_tree.configure(selectmode="extended")
 
     def _refresh_playlists_menu(self):
         self._playlists_menu.delete(0, "end")
@@ -983,7 +1141,7 @@ class App:
         for entry in entries:
             if entry.name.startswith(".") or entry.name.lower() in _HIDDEN_DIRS:
                 continue
-            if entry.is_file() and entry.suffix.lower() not in AUDIO_EXTS:
+            if entry.is_file() and entry.suffix.lower() not in AUDIO_EXTS | M3U_EXTS:
                 continue
             display = entry.name + ("/" if entry.is_dir() else "")
             iid = self.source_tree.insert(parent_iid, "end", text=display, values=(str(entry),))
@@ -1007,7 +1165,10 @@ class App:
             return
         path = Path(values[0])
         if path.is_file():
-            self._stage_add_files([path])
+            if path.suffix.lower() in M3U_EXTS:
+                self._import_m3u_file(path)
+            else:
+                self._stage_add_files([path])
 
     # ── Drag and drop ──
 
@@ -1081,32 +1242,43 @@ class App:
             pass
 
     def _add_selected_from_source(self, selected=None):
-        if not self.current_pid:
-            messagebox.showinfo("No playlist", "Select or create a playlist first.")
-            return
         if selected is None:
             selected = self.source_tree.selection()
         if not selected:
             return
-        paths = []
+
+        m3u_files = []
+        audio_paths = []
         for iid in selected:
             values = self.source_tree.item(iid, "values")
             if values:
                 p = Path(values[0])
                 if p.is_file():
-                    paths.append(p)
+                    if p.suffix.lower() in M3U_EXTS:
+                        m3u_files.append(p)
+                    else:
+                        audio_paths.append(p)
                 elif p.is_dir():
-                    paths.extend(sorted(
+                    audio_paths.extend(sorted(
                         f for f in p.rglob("*")
                         if f.is_file() and not f.name.startswith(".")
                         and f.suffix.lower() in AUDIO_EXTS
                     ))
-        if paths:
-            self._stage_add_files(paths)
+
+        for m3u in m3u_files:
+            self._import_m3u_file(m3u)
+
+        if audio_paths:
+            if not self.current_pid:
+                messagebox.showinfo("No playlist", "Select or create a playlist first.")
+                return
+            self._stage_add_files(audio_paths)
 
     # ── Staging operations ──
 
     def _stage_add_files(self, paths: list[Path]):
+        if self._syncing:
+            return
         if not self.current_pid:
             messagebox.showinfo("No playlist", "Select or create a playlist first.")
             return
@@ -1201,13 +1373,18 @@ class App:
             if result:
                 self._do_sync_blocking()
         self._alive = False
+        if self.mgr:
+            self.mgr.release_lock()
         t = getattr(self, "_stats_thread", None)
         if t:
             t.join(timeout=5)
         self.root.destroy()
 
     def _backup_before_sync(self):
-        """Create a restore point for every playlist that will be modified."""
+        """Create a restore point for affected playlists, respecting backup_interval."""
+        if not self.mgr.config.should_backup():
+            self.mgr.config.increment_sync(self.mgr.writer)
+            return
         affected = set()
         for a in self.staging.pending_adds:
             affected.add(a["pid"])
@@ -1221,21 +1398,35 @@ class App:
                     self.mgr.backup_playlist_metadata(pid)
                 except Exception:
                     pass
+        self.mgr.config.increment_sync(self.mgr.writer)
 
     def _do_sync_blocking(self):
         """Synchronous sync for use during close."""
         self._backup_before_sync()
-        for r in sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True):
+        removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
+        adds = list(self.staging.pending_adds)
+        journal = SyncJournal.begin(removes, adds, self.staging.pending_reorders)
+        idx = 0
+        for r in removes:
+            journal.mark_current(idx)
             try:
                 self.mgr.remove_track(r["pid"], r["index"])
             except Exception:
                 pass
-        for a in list(self.staging.pending_adds):
+            journal.mark_done(idx)
+            idx += 1
+        for a in adds:
+            journal.mark_current(idx)
             try:
                 self.mgr.add_track(a["pid"], a["src"])
             except Exception:
                 pass
+            journal.mark_done(idx)
+            idx += 1
         self._apply_reorders()
+        for i in range(idx, len(journal.actions)):
+            journal.mark_done(i)
+        journal.complete()
         self.staging.clear()
         self._undo_stack.clear()
         try:
@@ -1341,9 +1532,11 @@ class App:
     # ── SYNC ──
 
     def _do_sync(self):
-        if not self.staging.has_pending:
+        if not self.staging.has_pending or self._syncing:
             return
 
+        self._syncing = True
+        self._set_ui_locked(True)
         self._backup_before_sync()
         total = self.staging.total_ops
 
@@ -1359,37 +1552,62 @@ class App:
 
         adds = list(self.staging.pending_adds)
         removes = sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True)
+        journal = SyncJournal.begin(removes, adds, self.staging.pending_reorders)
 
         def worker():
             done = 0
             errors = []
+            j_idx = 0
+
+            def _ui(fn):
+                try:
+                    self.root.after(0, fn)
+                except RuntimeError:
+                    pass
 
             for r in removes:
+                journal.mark_current(j_idx)
                 done += 1
-                self.root.after(0, lambda d=done: _update_progress(d, "Removing..."))
+                _ui(lambda d=done: _update_progress(d, "Removing..."))
                 try:
                     self.mgr.remove_track(r["pid"], r["index"])
                 except Exception as e:
                     errors.append(f"Remove #{r['index']}: {e}")
+                journal.mark_done(j_idx)
+                j_idx += 1
 
             for i, a in enumerate(adds):
+                journal.mark_current(j_idx)
                 done += 1
                 title = a.get("title", Path(a["src"]).stem)
-                self.root.after(0, lambda d=done, t=title: _update_progress(d, t))
-                self.root.after(0, lambda: _update_file_progress(0))
+                _ui(lambda d=done, t=title: _update_progress(d, t))
+                _ui(lambda: _update_file_progress(0))
 
                 def on_copy_progress(copied, file_total):
                     pct = int(copied / file_total * 100) if file_total else 100
-                    self.root.after(0, lambda p=pct: _update_file_progress(p))
+                    _ui(lambda p=pct: _update_file_progress(p))
 
                 try:
                     self.mgr.add_track(a["pid"], a["src"], progress_cb=on_copy_progress)
                 except Exception as e:
                     errors.append(f"{Path(a['src']).name}: {e}")
-                self.root.after(0, lambda: _update_file_progress(100))
+                journal.mark_done(j_idx)
+                j_idx += 1
 
             self._apply_reorders()
-            self.root.after(0, lambda: _finish(errors))
+            for i in range(j_idx, len(journal.actions)):
+                journal.mark_done(i)
+            journal.complete()
+            try:
+                self.root.after(0, lambda: _finish(errors))
+            except RuntimeError:
+                self._syncing = False
+                self.staging.clear()
+                self._undo_stack.clear()
+                if errors:
+                    import sys
+                    print(f"EchoList: sync finished with errors "
+                          f"(UI already closed): {errors}", file=sys.stderr)
 
         def _update_progress(done, label=""):
             self.sync_progress["value"] = done
@@ -1399,6 +1617,8 @@ class App:
             self.sync_file_bar["value"] = pct
 
         def _finish(errors):
+            self._syncing = False
+            self._set_ui_locked(False)
             self.staging.clear()
             self._undo_stack.clear()
             self.sync_progress.pack_forget()
@@ -1425,6 +1645,8 @@ class App:
 
     def _refresh_all(self):
         """Reload source tree, playlists, tracks, and stats."""
+        if self._syncing:
+            return
         source_root = Path(self.mgr.config.source_root)
         if source_root.exists():
             self._populate_source_tree(source_root)
@@ -1478,7 +1700,14 @@ class App:
                 result = operation()
             except Exception as e:
                 error = e
-            self.root.after(0, lambda: finish(result, error))
+            try:
+                self.root.after(0, lambda: finish(result, error))
+            except RuntimeError:
+                self._busy_playlists.discard(pid)
+                if error:
+                    import sys
+                    print(f"EchoList: playlist op '{display_name}' failed "
+                          f"(UI already closed): {error}", file=sys.stderr)
 
         def finish(result, error):
             self._busy_playlists.discard(pid)
@@ -1699,6 +1928,8 @@ class App:
         self._run_playlist_op(pid, folder, adopt, on_done)
 
     def _create_playlist(self):
+        if self._syncing:
+            return
         temp_name = "New Playlist"
         try:
             pid = self.mgr.create_playlist(temp_name)
@@ -1723,7 +1954,75 @@ class App:
         self._refresh_tracks()
         self.root.after(50, lambda: self._start_inline_rename(pid))
 
+    # ── .m3u import ──
+
+    def _import_m3u_dialog(self):
+        """Open a file picker to import .m3u/.m3u8 playlists."""
+        if self._syncing:
+            return
+        files = filedialog.askopenfilenames(
+            title="Import .m3u playlists",
+            filetypes=[("M3U playlists", "*.m3u *.m3u8"), ("All files", "*.*")],
+            initialdir=self.source or str(Path.home()),
+        )
+        if not files:
+            return
+        for f in files:
+            self._import_m3u_file(Path(f))
+
+    def _import_m3u_file(self, m3u_path: Path):
+        """Parse one .m3u file, create a playlist, and stage found tracks."""
+        source_root = Path(self.mgr.config.source_root)
+        result = parse_m3u(m3u_path, source_root=source_root)
+
+        existing_pids = set(self.mgr.store.playlists.keys())
+        name = curate_playlist_name(result["name"], existing_pids)
+        tracks = result["tracks"]
+        missing = result["missing"]
+
+        if not tracks and not missing:
+            messagebox.showinfo("Empty playlist",
+                                f"'{m3u_path.name}' contains no track entries.")
+            return
+
+        if not tracks and missing:
+            messagebox.showwarning(
+                "No tracks found",
+                f"'{m3u_path.name}' has {len(missing)} entry(ies) but none "
+                f"could be found on disk.\n\n"
+                f"Make sure the source library path is correct in Settings.",
+            )
+            return
+
+        try:
+            pid = self.mgr.create_playlist(name)
+        except ValueError:
+            messagebox.showerror("Error", f"Could not create playlist '{name}'.")
+            return
+
+        for track_path in tracks:
+            title, artist = _read_tags_from_file(track_path)
+            self.staging.stage_add(pid, str(track_path), title, artist)
+
+        self._refresh_playlists()
+        self.playlist_tree.selection_set(pid)
+        self.current_pid = pid
+        self._refresh_tracks()
+        self._update_status()
+
+        parts = [f"Created playlist '{name}' from {m3u_path.name}",
+                 f"{len(tracks)} track(s) staged for sync."]
+        if missing:
+            parts.append(f"\n{len(missing)} track(s) could not be found:")
+            for m in missing[:10]:
+                parts.append(f"  - {m}")
+            if len(missing) > 10:
+                parts.append(f"  ... and {len(missing) - 10} more")
+        messagebox.showinfo("Playlist imported", "\n".join(parts))
+
     def _start_inline_rename(self, pid):
+        if pid not in self.mgr.store.playlists:
+            return
         self.playlist_tree.update_idletasks()
         try:
             bbox = self.playlist_tree.bbox(pid, column="name")
@@ -1781,6 +2080,8 @@ class App:
         self._rename_entry = entry
 
     def _delete_playlist(self):
+        if self._syncing:
+            return
         if not self.current_pid:
             return
         pl = self.mgr.store.playlists.get(self.current_pid)
@@ -2031,6 +2332,8 @@ class App:
         return copy_name or "", ""
 
     def _remove_track(self, event=None):
+        if self._syncing:
+            return
         if not self.current_pid:
             return
         selected = self.track_tree.selection()

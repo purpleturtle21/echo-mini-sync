@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
+
+_MAX_TAG_WORKERS = 8
 from datetime import datetime
 from pathlib import Path
 
 from .safe_write import SafeWriter, UnsafeWriteError
 from .config import (
-    Config, save_backup, list_backups, list_all_backup_pids, load_backup,
+    Config, DEFAULT_PLAYLIST_FOLDER,
+    save_backup, list_backups, list_all_backup_pids, load_backup,
     save_playlist_snapshot, load_playlist_snapshot,
 )
 from .store import Store
@@ -24,11 +28,16 @@ except ImportError:
     mutagen = None
 
 
+class WorkspaceLockError(Exception):
+    ...
+
+
 class PlaylistManager:
     def __init__(self, writer: SafeWriter, config: Config, store: Store):
         self.writer = writer
         self.config = config
         self.store = store
+        self._lock_fd = None
 
     @classmethod
     def init(
@@ -37,22 +46,30 @@ class PlaylistManager:
         dest_root: str | Path,
         node_name: str = "* PLAYLISTS *",
         album_prefix: str = "",
+        playlist_folder: str = DEFAULT_PLAYLIST_FOLDER,
+        backup_interval: int = 5,
     ) -> PlaylistManager:
         source_root = Path(source_root).resolve()
-        workspace = Path(dest_root).resolve() / "Playlists"
+        workspace = Path(dest_root).resolve() / playlist_folder
         _check_overlap(source_root, workspace)
         writer = SafeWriter(workspace)
         config = Config(
             source_root=str(source_root),
             node_name=node_name,
             album_prefix=album_prefix,
+            playlist_folder=playlist_folder,
+            backup_interval=backup_interval,
         )
         store = Store.load(writer)
-        return cls(writer, config, store)
+        mgr = cls(writer, config, store)
+        mgr._acquire_lock()
+        config.save(writer)
+        return mgr
 
     @classmethod
-    def open(cls, dest_root: str | Path) -> PlaylistManager:
-        workspace = Path(dest_root).resolve() / "Playlists"
+    def open(cls, dest_root: str | Path, playlist_folder: str | None = None) -> PlaylistManager:
+        folder = playlist_folder or DEFAULT_PLAYLIST_FOLDER
+        workspace = Path(dest_root).resolve() / folder
         writer = SafeWriter(workspace)
         config = Config.load(writer)
         if not config.source_root:
@@ -60,7 +77,40 @@ class PlaylistManager:
         source_root = Path(config.source_root).resolve()
         _check_overlap(source_root, workspace)
         store = Store.load(writer)
-        return cls(writer, config, store)
+        mgr = cls(writer, config, store)
+        mgr._acquire_lock()
+        return mgr
+
+    def _acquire_lock(self) -> None:
+        lock_path = self.writer.root / ".echolist" / "workspace.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_fd = fd
+        except (OSError, IOError):
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise WorkspaceLockError(
+                "Another EchoList instance is using this workspace. "
+                "Close it first, or delete .echolist/workspace.lock if "
+                "the previous session crashed."
+            )
+
+    def release_lock(self) -> None:
+        if self._lock_fd is not None:
+            try:
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
 
     def create_playlist(self, name: str) -> str:
         pid = playlist_id(name)
@@ -403,7 +453,7 @@ class PlaylistManager:
             path, index, src_rel = job
             apply_playlist_tags(path, self.config.node_name, album, index, src_rel, pid)
 
-        with ThreadPoolExecutor() as pool:
+        with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             list(pool.map(_apply, fix_jobs))
 
         self._renumber_tracks(pid)
@@ -662,7 +712,7 @@ class PlaylistManager:
 
         self.store.add_playlist(pid, folder_name, folder_name)
 
-        with ThreadPoolExecutor() as pool:
+        with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             tag_results = list(pool.map(read_playlist_tags, audio_files))
 
         for i, (f, original_tags) in enumerate(zip(audio_files, tag_results), 1):
@@ -701,7 +751,7 @@ class PlaylistManager:
                     t["index"], "", pid,
                 )
 
-        with ThreadPoolExecutor() as pool:
+        with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
             list(pool.map(_apply_tags, self.store.playlists[pid]["tracks"]))
 
         self._renumber_tracks(pid)
@@ -719,8 +769,8 @@ class PlaylistManager:
         )
 
     @staticmethod
-    def find_snapshot(dest_root: str | Path) -> dict | None:
-        workspace_root = Path(dest_root).resolve() / "Playlists"
+    def find_snapshot(dest_root: str | Path, playlist_folder: str = DEFAULT_PLAYLIST_FOLDER) -> dict | None:
+        workspace_root = Path(dest_root).resolve() / playlist_folder
         return load_playlist_snapshot(workspace_root)
 
 

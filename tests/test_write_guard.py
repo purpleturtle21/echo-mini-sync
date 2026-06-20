@@ -52,8 +52,9 @@ SKIP_FILES = {"safe_write.py", "__init__.py", "__main__.py"}
 ALLOWED_EXCEPTIONS = {
     "tags.py": {"save"},
     # config.py calls writer.write_text() (SafeWriter) and writes ~/.echolist/
-    # backups (user-local metadata snapshots)
-    "config.py": {"write_text", "mkdir"},
+    # backups (user-local metadata snapshots); .save() is Config.save(writer)
+    # which routes through SafeWriter.write_text
+    "config.py": {"write_text", "mkdir", "save"},
     "store.py": {"write_text"},
     # cli.py writes ~/.echolist/default.json (user-local, not workspace)
     "cli.py": {"mkdir", "write_text"},
@@ -63,6 +64,9 @@ ALLOWED_EXCEPTIONS = {
     # manager.py uses SafeWriter.rename via self.writer — and open() for hashing;
     # .save() calls are on Store/Config wrapper objects, not mutagen
     "manager.py": {"rename", "mkdir", "save"},
+    # journal.py writes ~/.echolist/sync_journal.json (user-local crash-recovery
+    # state); .unlink() is for cleanup of the journal file on completion
+    "journal.py": {"unlink"},
 }
 
 ALLOWED_OPEN = {"manager.py"}

@@ -124,6 +124,7 @@ def test_workspace_inside_source_allowed(tmp_path):
     src.mkdir()
     mgr = PlaylistManager.init(src, src)
     assert mgr.writer.root == (src / "Playlists").resolve()
+    mgr.release_lock()
 
 
 # ── Star prefix tests ──
@@ -467,6 +468,9 @@ def test_snapshot_restore_creates_playlists(manager, source, dest):
     manager.add_track(pid, source / "ArtistA" / "Album1" / "01 Song One.flac")
     manager.save_snapshot()
 
+    # Release lock before wiping so Windows can delete the lock file
+    manager.release_lock()
+
     # Wipe the device
     shutil.rmtree(manager.writer.root)
 
@@ -496,6 +500,7 @@ def test_snapshot_restore_creates_playlists(manager, source, dest):
                 mgr2.add_track(pid, src)
 
     assert len(mgr2.store.playlists["workout"]["tracks"]) == 1
+    mgr2.release_lock()
 
 
 # ── Deleted playlist restore tests ──

@@ -30,7 +30,8 @@ def gui_env(tmp_path):
     dest = tmp_path / "card"
     dest.mkdir()
     mgr = PlaylistManager.init(src, dest)
-    return {"src": src, "dest": dest, "mgr": mgr, "tmp": tmp_path}
+    yield {"src": src, "dest": dest, "mgr": mgr, "tmp": tmp_path}
+    mgr.release_lock()
 
 
 @pytest.fixture
@@ -59,6 +60,7 @@ def app(gui_env, monkeypatch):
     a._cached_workspace_bytes = 0
     a._stats_pending = False
     a._alive = True
+    a._syncing = False
     a._apply_theme()
     a._show_main()
 
@@ -67,6 +69,7 @@ def app(gui_env, monkeypatch):
     t = getattr(a, "_stats_thread", None)
     if t:
         t.join(timeout=5)
+    _flush_bg_ops(a, timeout=5)
     a.root.destroy()
 
 
@@ -532,6 +535,72 @@ class TestAppReorder:
         folder = app.mgr.store.playlists[app.current_pid]["folder"]
         for t in tracks:
             assert (app.mgr.writer.root / folder / t["copy_name"]).exists()
+
+
+class TestM3uImport:
+    def test_import_m3u_creates_playlist_and_stages(self, app, gui_env):
+        """Importing a .m3u file creates a playlist and stages found tracks."""
+        m3u = gui_env["tmp"] / "My Workout.m3u"
+        m3u.write_text(
+            "#EXTM3U\n"
+            "ArtistA/Album1/01 Song One.flac\n"
+            "ArtistB/Album2/03 Song Two.flac\n",
+            encoding="utf-8",
+        )
+        with patch("echolist.gui.messagebox.showinfo"):
+            app._import_m3u_file(m3u)
+
+        assert "my_workout" in app.mgr.store.playlists
+        assert app.current_pid == "my_workout"
+        assert len(app.staging.pending_adds) == 2
+
+    def test_import_m3u_with_missing_shows_warning(self, app, gui_env):
+        """Missing tracks are reported but found tracks are still staged."""
+        m3u = gui_env["tmp"] / "Partial.m3u"
+        m3u.write_text(
+            "ArtistA/Album1/01 Song One.flac\n"
+            "nonexistent/gone.flac\n",
+            encoding="utf-8",
+        )
+        with patch("echolist.gui.messagebox.showinfo") as mock_info:
+            app._import_m3u_file(m3u)
+
+        assert "partial" in app.mgr.store.playlists
+        assert len(app.staging.pending_adds) == 1
+        call_text = mock_info.call_args[0][1]
+        assert "1 track(s) could not be found" in call_text
+
+    def test_import_m3u_all_missing_shows_warning(self, app, gui_env):
+        """If no tracks are found, show a warning and don't create a playlist."""
+        m3u = gui_env["tmp"] / "Empty.m3u"
+        m3u.write_text("nope/a.flac\nnope/b.flac\n", encoding="utf-8")
+        with patch("echolist.gui.messagebox.showwarning"):
+            app._import_m3u_file(m3u)
+
+        assert "empty" not in app.mgr.store.playlists
+
+    def test_import_m3u_name_collision_curated(self, app, gui_env):
+        """Importing a .m3u with a name that already exists gets auto-renamed."""
+        app._create_playlist()  # creates "new_playlist"
+        m3u = gui_env["tmp"] / "New Playlist.m3u"
+        m3u.write_text("ArtistA/Album1/01 Song One.flac\n", encoding="utf-8")
+        with patch("echolist.gui.messagebox.showinfo"):
+            app._import_m3u_file(m3u)
+
+        assert "new_playlist_(2)" in app.mgr.store.playlists
+
+    def test_import_m3u_sync_copies_files(self, app, gui_env):
+        """After importing and syncing, tracks are copied to device."""
+        m3u = gui_env["tmp"] / "Sync Test.m3u"
+        m3u.write_text("ArtistA/Album1/01 Song One.flac\n", encoding="utf-8")
+        with patch("echolist.gui.messagebox.showinfo"):
+            app._import_m3u_file(m3u)
+
+        app._do_sync_blocking()
+        tracks = app.mgr.store.playlists["sync_test"]["tracks"]
+        assert len(tracks) == 1
+        folder = app.mgr.store.playlists["sync_test"]["folder"]
+        assert (app.mgr.writer.root / folder / tracks[0]["copy_name"]).exists()
 
 
 class TestReadTags:
