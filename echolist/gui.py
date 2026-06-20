@@ -11,6 +11,7 @@ import os
 import signal
 import platform
 import string
+from datetime import datetime
 
 from .manager import PlaylistManager, AUDIO_EXTS
 from .naming import playlist_id, sanitize
@@ -103,6 +104,14 @@ def _read_tags_from_file(path: Path) -> tuple[str, str]:
     except Exception:
         pass
     return path.stem, ""
+
+
+def _format_backup_timestamp(ts: str) -> str:
+    try:
+        dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts
 
 
 class StagingState:
@@ -444,9 +453,17 @@ class App:
     def _open_workspace(self, source: str, dest: str):
         try:
             workspace = Path(dest) / "Playlists" / ".echolist" / "config.json"
+            playlists_dir = Path(dest) / "Playlists"
+            is_external = playlists_dir.exists() and not workspace.exists()
+            is_empty = not workspace.exists()
+
             if workspace.exists():
                 mgr = PlaylistManager.open(dest)
             else:
+                # Check for a snapshot before initializing
+                snapshot = PlaylistManager.find_snapshot(dest)
+                if snapshot and self._offer_snapshot_restore(snapshot, source, dest):
+                    return
                 mgr = PlaylistManager.init(source, dest)
             save_defaults(source, dest)
         except Exception as e:
@@ -456,7 +473,106 @@ class App:
         self.source = source
         self.dest = dest
         self.root.unbind("<Return>")
+
+        if is_external and is_empty:
+            has_audio = any(
+                f.suffix.lower() in AUDIO_EXTS
+                for f in playlists_dir.rglob("*") if f.is_file()
+            )
+            if has_audio:
+                messagebox.showwarning(
+                    "Possible external playlist",
+                    f"The folder:\n{playlists_dir}\n\n"
+                    "contains audio files but was not created by EchoList. "
+                    "You may have imported this playlist from an external source.\n\n"
+                    "EchoList will need to modify metadata (album artist, album, "
+                    "track number) on files in this folder to make playlists work "
+                    "on the device.\n\n"
+                    "Make sure this is not your only copy of these files.",
+                )
+
         self._show_main()
+
+    def _offer_snapshot_restore(self, snapshot: dict, source: str, dest: str) -> bool:
+        """Show restore dialog. Returns True if restore was accepted (and workspace opened)."""
+        store_data = snapshot.get("store", {})
+        playlists = store_data.get("playlists", {})
+        if not playlists:
+            return False
+
+        snap_config = snapshot.get("config", {})
+        snap_source = snap_config.get("source_root", source)
+
+        workspace = Path(dest) / "Playlists"
+        total_tracks = sum(len(pl.get("tracks", [])) for pl in playlists.values())
+        pl_list = "\n".join(
+            f"  - {workspace / pl['folder']}"
+            for pl in list(playlists.values())[:8]
+        )
+        if len(playlists) > 8:
+            pl_list += f"\n  ... and {len(playlists) - 8} more"
+
+        result = messagebox.askyesno(
+            "Previous playlists found",
+            f"This device had EchoList playlists before.\n\n"
+            f"Playlists will be restored to:\n{pl_list}\n\n"
+            f"{total_tracks} track(s) total.\n\n"
+            f"Source library: {snap_source}\n\n"
+            f"Restore these playlists? The tracks will be staged as "
+            f"pending — press Sync to re-copy them to the device.",
+        )
+        if not result:
+            return False
+
+        try:
+            mgr = PlaylistManager.init(
+                snap_source, dest,
+                node_name=snap_config.get("node_name", "* PLAYLISTS *"),
+                album_prefix=snap_config.get("album_prefix", ""),
+            )
+            save_defaults(snap_source, dest)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return False
+
+        self.mgr = mgr
+        self.source = snap_source
+        self.dest = dest
+        self.root.unbind("<Return>")
+
+        missing_sources = []
+        source_root = Path(snap_source)
+        for pid, pl in playlists.items():
+            try:
+                mgr.create_playlist(pl["name"])
+            except ValueError:
+                pass
+            for t in pl.get("tracks", []):
+                src_path = t.get("src_path", "")
+                if not src_path:
+                    continue
+                full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
+                if full.exists():
+                    title, artist = _read_tags_from_file(full)
+                    self.staging.stage_add(pid, str(full), title, artist)
+                else:
+                    missing_sources.append(src_path)
+
+        self._show_main()
+
+        if missing_sources:
+            n = len(missing_sources)
+            sample = "\n".join(f"  - {s}" for s in missing_sources[:10])
+            if n > 10:
+                sample += f"\n  ... and {n - 10} more"
+            messagebox.showwarning(
+                "Some source files missing",
+                f"{n} track(s) could not be found in the source library "
+                f"and were skipped:\n\n{sample}\n\n"
+                f"The remaining tracks are staged and ready to sync.",
+            )
+
+        return True
 
     # ── Main ──
 
@@ -517,6 +633,16 @@ class App:
         ttk.Button(pl_header, text="+ New", command=self._create_playlist).pack(side="right", padx=(4, 0))
         ttk.Button(pl_header, text="Delete", command=self._delete_playlist).pack(side="right")
 
+
+        # TODO: star prefix feature disabled — re-enable when stable
+        # self._star_var = tk.BooleanVar(value=self.mgr.config.star_prefix)
+        # self._star_cb = tk.Checkbutton(pl_header, text="★", variable=self._star_var,
+        #                                 command=self._toggle_star_prefix,
+        #                                 bg=BG, fg=FG, selectcolor=BG_INPUT,
+        #                                 activebackground=BG, activeforeground=FG,
+        #                                 font=("Consolas", 11))
+        # self._star_cb.pack(side="right", padx=(0, 4))
+
         pl_tree_frame = ttk.Frame(pl_frame)
         pl_tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.playlist_tree = ttk.Treeview(pl_tree_frame, columns=("name",), show="tree",
@@ -524,9 +650,15 @@ class App:
         self.playlist_tree.column("#0", width=0, stretch=False)
         self.playlist_tree.column("name", width=200)
         self.playlist_tree.pack(side="left", fill="both", expand=True)
+        self.playlist_tree.tag_configure("imported", foreground="#dd8833")
+        self.playlist_tree.tag_configure("busy", foreground=FG_DIM)
         self.playlist_tree.bind("<<TreeviewSelect>>", self._on_playlist_select)
 
         self._rename_entry = None
+        self._busy_playlists: set[str] = set()
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._spinner_idx = 0
+        self._spinner_after_id = None
 
         # ── RIGHT COLUMN: tracks ──
         right_col = ttk.Frame(main_pw)
@@ -536,6 +668,8 @@ class App:
         trk_header.pack(fill="x", padx=4, pady=(4, 2))
         ttk.Label(trk_header, text="TRACKS", style="Section.TLabel").pack(side="left")
         ttk.Button(trk_header, text="Remove", command=self._remove_track).pack(side="right")
+        self.fix_meta_btn = ttk.Button(trk_header, text="Fix metadata",
+                                        command=self._fix_metadata_clicked)
         self.undo_btn = ttk.Button(trk_header, text="Undo", command=self._do_undo)
         self.undo_btn.pack(side="right", padx=(0, 4))
         self.undo_lbl = tk.Label(trk_header, text="", font=("Consolas", 8),
@@ -650,11 +784,190 @@ class App:
         self.root.config(menu=menubar)
         file_menu = tk.Menu(menubar, tearoff=0, bg=BG_PANEL, fg=FG,
                             activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        file_menu.add_command(label="Refresh", command=self._refresh_all, accelerator="F5")
+        file_menu.add_separator()
         file_menu.add_command(label="Change workspace...", command=self._show_setup)
         file_menu.add_command(label="Advanced setup...", command=self._show_advanced_setup)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
+        self.root.bind("<F5>", lambda e: self._refresh_all())
         menubar.add_cascade(label="File", menu=file_menu)
+
+        self._playlists_menu = tk.Menu(menubar, tearoff=0, bg=BG_PANEL, fg=FG,
+                                        activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        menubar.add_cascade(label="Playlists", menu=self._playlists_menu)
+        self._refresh_playlists_menu()
+
+    def _refresh_playlists_menu(self):
+        self._playlists_menu.delete(0, "end")
+        if not self.mgr:
+            return
+        for pid, pl in self.mgr.store.playlists.items():
+            sub = tk.Menu(self._playlists_menu, tearoff=0, bg=BG_PANEL, fg=FG,
+                          activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+
+            sub.add_command(
+                label="Create new restore point",
+                command=lambda p=pid: self._create_restore_point(p),
+            )
+            sub.add_separator()
+
+            backups = self.mgr.list_metadata_backups(pid)
+            if backups:
+                for b in backups:
+                    ts = b["timestamp"]
+                    label = _format_backup_timestamp(ts)
+                    sub.add_command(
+                        label=f"Restore: {label}",
+                        command=lambda p=pid, t=ts: self._restore_from_point(p, t),
+                    )
+            else:
+                sub.add_command(label="(no restore points)", state="disabled")
+
+            self._playlists_menu.add_cascade(label=pl["name"], menu=sub)
+
+        deleted = self.mgr.list_deleted_playlists()
+        if deleted:
+            self._playlists_menu.add_separator()
+            for info in deleted:
+                pid = info["pid"]
+                name = info["name"]
+                sub = tk.Menu(self._playlists_menu, tearoff=0, bg=BG_PANEL, fg=FG,
+                              activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+                for b in info["backups"]:
+                    ts = b["timestamp"]
+                    label = _format_backup_timestamp(ts)
+                    sub.add_command(
+                        label=f"Restore: {label}",
+                        command=lambda p=pid, t=ts: self._restore_deleted(p, t),
+                    )
+                self._playlists_menu.add_cascade(label=f"{name} (deleted)", menu=sub)
+
+    def _create_restore_point(self, pid: str):
+        playlist = self.mgr.store.playlists.get(pid)
+        if not playlist:
+            return
+        folder_path = self.mgr.writer.root / playlist["folder"]
+        result = self.mgr.backup_playlist_metadata(pid)
+        if result:
+            self._refresh_playlists_menu()
+            messagebox.showinfo(
+                "Restore point created",
+                f"Saved metadata snapshot for '{playlist['name']}'.\n\n"
+                f"Tracks in:\n{folder_path}",
+            )
+        else:
+            messagebox.showinfo(
+                "No tracks",
+                f"Playlist '{playlist['name']}' has no tracks to back up.",
+            )
+
+    def _restore_from_point(self, pid: str, timestamp: str):
+        playlist = self.mgr.store.playlists.get(pid)
+        if not playlist:
+            return
+        label = _format_backup_timestamp(timestamp)
+        confirm = messagebox.askyesno(
+            "Restore to point",
+            f"Restore playlist '{playlist['name']}' to '{label}'?\n\n"
+            f"This will restore the playlist to exactly how it was at that point:\n"
+            f"- Tracks added since then will be removed\n"
+            f"- Tracks deleted since then will be re-staged for sync\n"
+            f"- Metadata will be restored on remaining tracks\n\n"
+            f"A restore point of the current state will be saved first.\n\n"
+            f"Continue?",
+        )
+        if not confirm:
+            return
+        name = playlist["name"]
+
+        def restore():
+            return self.mgr.restore_playlist_to_point(pid, timestamp)
+
+        def on_done(result):
+            source_root = Path(self.mgr.config.source_root)
+            missing = []
+            for s in result["to_stage"]:
+                src_path = s["src_path"]
+                full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
+                if full.exists():
+                    title, artist = _read_tags_from_file(full)
+                    self.staging.stage_add(pid, str(full), title, artist)
+                else:
+                    missing.append(src_path)
+
+            self._refresh_playlists()
+            self._refresh_tracks()
+            self._update_status()
+
+            parts = []
+            if result["restored"]:
+                parts.append(f"Restored metadata on {result['restored']} track(s).")
+            if result["removed"]:
+                parts.append(f"Removed {result['removed']} track(s) added after this point.")
+            if result["to_stage"]:
+                staged = len(result["to_stage"]) - len(missing)
+                if staged:
+                    parts.append(f"Staged {staged} track(s) for re-syncing.")
+            if missing:
+                parts.append(f"{len(missing)} source file(s) could not be found.")
+            messagebox.showinfo("Playlist restored", "\n".join(parts) if parts else "No changes needed.")
+
+        self._run_playlist_op(pid, name, restore, on_done)
+
+    def _restore_deleted(self, pid: str, timestamp: str):
+        label = _format_backup_timestamp(timestamp)
+        from .config import load_backup
+        data = load_backup(self.mgr.writer.root, pid, timestamp)
+        if not data:
+            messagebox.showerror("Error", "Could not load backup data.")
+            return
+        name = data.get("playlist_name", pid)
+        tracks = data.get("tracks", [])
+        src_count = sum(1 for t in tracks if t.get("src_path"))
+
+        confirm = messagebox.askyesno(
+            "Restore deleted playlist",
+            f"Restore playlist '{name}' from '{label}'?\n\n"
+            f"{src_count} track(s) will be staged for syncing.\n\n"
+            f"Press Sync after restoring to copy the tracks back to the device.",
+        )
+        if not confirm:
+            return
+
+        self.playlist_tree.insert("", "end", iid=pid, values=(name,))
+
+        def restore():
+            return self.mgr.restore_deleted_playlist(pid, timestamp)
+
+        def on_done(sources):
+            source_root = Path(self.mgr.config.source_root)
+            missing = []
+            for s in sources:
+                src_path = s["src_path"]
+                full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
+                if full.exists():
+                    title, artist = _read_tags_from_file(full)
+                    self.staging.stage_add(pid, str(full), title, artist)
+                else:
+                    missing.append(src_path)
+
+            self._refresh_playlists()
+            self._update_status()
+
+            if missing:
+                n = len(missing)
+                sample = "\n".join(f"  - {s}" for s in missing[:10])
+                if n > 10:
+                    sample += f"\n  ... and {n - 10} more"
+                messagebox.showwarning(
+                    "Some source files missing",
+                    f"{n} track(s) could not be found in the source library "
+                    f"and were skipped:\n\n{sample}\n\n"
+                    f"The remaining tracks are staged and ready to sync.",
+                )
+
+        self._run_playlist_op(pid, name, restore, on_done)
 
     # ── Source tree ──
 
@@ -893,8 +1206,25 @@ class App:
             t.join(timeout=5)
         self.root.destroy()
 
+    def _backup_before_sync(self):
+        """Create a restore point for every playlist that will be modified."""
+        affected = set()
+        for a in self.staging.pending_adds:
+            affected.add(a["pid"])
+        for r in self.staging.pending_removes:
+            affected.add(r["pid"])
+        for pid in self.staging.pending_reorders:
+            affected.add(pid)
+        for pid in affected:
+            if pid in self.mgr.store.playlists:
+                try:
+                    self.mgr.backup_playlist_metadata(pid)
+                except Exception:
+                    pass
+
     def _do_sync_blocking(self):
         """Synchronous sync for use during close."""
+        self._backup_before_sync()
         for r in sorted(self.staging.pending_removes, key=lambda r: r["index"], reverse=True):
             try:
                 self.mgr.remove_track(r["pid"], r["index"])
@@ -908,6 +1238,10 @@ class App:
         self._apply_reorders()
         self.staging.clear()
         self._undo_stack.clear()
+        try:
+            self.mgr.save_snapshot()
+        except Exception:
+            pass
 
     def _apply_reorders(self):
         """Re-tag and rename committed tracks to match the staged reorder."""
@@ -1010,6 +1344,7 @@ class App:
         if not self.staging.has_pending:
             return
 
+        self._backup_before_sync()
         total = self.staging.total_ops
 
         # Swap button for progress bars
@@ -1073,6 +1408,10 @@ class App:
             self._refresh_playlists()
             self._update_status()
             self._refresh_expensive_stats()
+            try:
+                self.mgr.save_snapshot()
+            except Exception:
+                pass
             if errors:
                 messagebox.showwarning("Sync errors",
                                         f"Completed with errors:\n" + "\n".join(errors[:15]))
@@ -1084,10 +1423,34 @@ class App:
 
     # ── Playlists ──
 
+    def _refresh_all(self):
+        """Reload source tree, playlists, tracks, and stats."""
+        source_root = Path(self.mgr.config.source_root)
+        if source_root.exists():
+            self._populate_source_tree(source_root)
+        for pid in list(self.mgr.store.playlists):
+            self.mgr.rescan_playlist(pid)
+        self._refresh_playlists()
+        self._refresh_tracks()
+        self._update_status()
+        self._refresh_expensive_stats()
+
     def _refresh_playlists(self):
         self.playlist_tree.delete(*self.playlist_tree.get_children())
         for pid, pl in self.mgr.store.playlists.items():
             self.playlist_tree.insert("", "end", iid=pid, values=(pl["name"],))
+        self._untracked_playlists = {}
+        try:
+            for info in self.mgr.detect_untracked_playlists():
+                iid = f"_imported:{info['folder']}"
+                self.playlist_tree.insert(
+                    "", "end", iid=iid,
+                    values=(f"{info['folder']} ({info['track_count']} tracks)",),
+                    tags=("imported",),
+                )
+                self._untracked_playlists[iid] = info
+        except Exception:
+            pass
         children = self.playlist_tree.get_children()
         if children:
             if self.current_pid and self.current_pid in children:
@@ -1095,6 +1458,71 @@ class App:
             else:
                 self.playlist_tree.selection_set(children[0])
             self._on_playlist_select(None)
+        if hasattr(self, "_playlists_menu"):
+            self._refresh_playlists_menu()
+
+    def _run_playlist_op(self, pid: str, display_name: str, operation, on_done=None):
+        """Run a blocking playlist operation in a background thread with spinner."""
+        self._busy_playlists.add(pid)
+        try:
+            self.playlist_tree.item(pid, values=(f"{display_name} {self._spinner_frames[0]}",),
+                                    tags=("busy",))
+        except Exception:
+            pass
+        self._start_spinner()
+
+        def worker():
+            error = None
+            result = None
+            try:
+                result = operation()
+            except Exception as e:
+                error = e
+            self.root.after(0, lambda: finish(result, error))
+
+        def finish(result, error):
+            self._busy_playlists.discard(pid)
+            if not self._busy_playlists:
+                self._stop_spinner()
+            try:
+                if pid in [c for c in self.playlist_tree.get_children()]:
+                    pl = self.mgr.store.playlists.get(pid)
+                    name = pl["name"] if pl else display_name
+                    self.playlist_tree.item(pid, values=(name,), tags=())
+            except Exception:
+                pass
+            if error:
+                messagebox.showerror("Error", str(error))
+            elif on_done:
+                on_done(result)
+
+        Thread(target=worker, daemon=True).start()
+
+    def _start_spinner(self):
+        if self._spinner_after_id is not None:
+            return
+        self._tick_spinner()
+
+    def _stop_spinner(self):
+        if self._spinner_after_id is not None:
+            self.root.after_cancel(self._spinner_after_id)
+            self._spinner_after_id = None
+
+    def _tick_spinner(self):
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        frame = self._spinner_frames[self._spinner_idx]
+        for pid in list(self._busy_playlists):
+            try:
+                old = self.playlist_tree.item(pid, "values")
+                if old:
+                    base = old[0].rsplit(" ", 1)[0]
+                    self.playlist_tree.item(pid, values=(f"{base} {frame}",))
+            except Exception:
+                pass
+        if self._busy_playlists:
+            self._spinner_after_id = self.root.after(80, self._tick_spinner)
+        else:
+            self._spinner_after_id = None
 
     def _on_playlist_select(self, event):
         sel = self.playlist_tree.selection()
@@ -1102,8 +1530,173 @@ class App:
             self.current_pid = None
             self.track_tree.delete(*self.track_tree.get_children())
             return
-        self.current_pid = sel[0]
+        selected = sel[0]
+        if selected in self._busy_playlists:
+            self.playlist_tree.selection_remove(selected)
+            if self.current_pid and self.current_pid not in self._busy_playlists:
+                try:
+                    self.playlist_tree.selection_set(self.current_pid)
+                except Exception:
+                    pass
+            return
+        if selected.startswith("_imported:"):
+            self.current_pid = None
+            self.track_tree.delete(*self.track_tree.get_children())
+            self.fix_meta_btn.pack_forget()
+            info = self._untracked_playlists.get(selected)
+            if info:
+                self._offer_adopt_playlist(info)
+            return
+        self.current_pid = selected
         self._refresh_tracks()
+        self._check_metadata_sync()
+
+    def _check_metadata_sync(self):
+        if not self.current_pid:
+            self.fix_meta_btn.pack_forget()
+            return
+
+        issues = self.mgr.audit_playlist_metadata(self.current_pid)
+        if issues:
+            n = len(set(i["copy_name"] for i in issues))
+            self.fix_meta_btn.config(text=f"Fix metadata ({n})")
+            self.fix_meta_btn.pack(side="right", padx=(0, 4))
+            self._set_fix_meta_tooltip(issues)
+        else:
+            self.fix_meta_btn.pack_forget()
+            self._clear_fix_meta_tooltip()
+
+    def _set_fix_meta_tooltip(self, issues: list[dict]):
+        by_file: dict[str, list[str]] = {}
+        for i in issues:
+            by_file.setdefault(i["copy_name"], []).append(
+                f"{i['field']}: '{i['actual']}' → '{i['expected']}'"
+            )
+        lines = []
+        for name, fixes in list(by_file.items())[:8]:
+            lines.append(name)
+            for f in fixes:
+                lines.append(f"  {f}")
+        if len(by_file) > 8:
+            lines.append(f"... and {len(by_file) - 8} more file(s)")
+        tip_text = "\n".join(lines)
+
+        tip_win = [None]
+
+        def show(event):
+            tw = tk.Toplevel(self.root)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+            lbl = tk.Label(tw, text=tip_text, justify="left",
+                           bg="#333333", fg="#eeeeee", font=("Consolas", 9),
+                           padx=6, pady=4, wraplength=500)
+            lbl.pack()
+            tip_win[0] = tw
+
+        def hide(event):
+            if tip_win[0]:
+                tip_win[0].destroy()
+                tip_win[0] = None
+
+        self.fix_meta_btn.bind("<Enter>", show)
+        self.fix_meta_btn.bind("<Leave>", hide)
+
+    def _clear_fix_meta_tooltip(self):
+        self.fix_meta_btn.unbind("<Enter>")
+        self.fix_meta_btn.unbind("<Leave>")
+
+    def _fix_metadata_clicked(self):
+        if not self.current_pid:
+            return
+        issues = self.mgr.audit_playlist_metadata(self.current_pid)
+        if not issues:
+            self.fix_meta_btn.pack_forget()
+            return
+
+        affected_files = sorted(set(i["copy_name"] for i in issues))
+        playlist = self.mgr.store.playlists[self.current_pid]
+        folder_path = self.mgr.writer.root / playlist["folder"]
+
+        file_list = "\n".join(f"  - {f}" for f in affected_files[:10])
+        if len(affected_files) > 10:
+            file_list += f"\n  ... and {len(affected_files) - 10} more"
+
+        result = messagebox.askyesno(
+            "Metadata out of sync",
+            f"{len(affected_files)} track(s) in this playlist have metadata that "
+            f"doesn't match what EchoList expects.\n\n"
+            f"Folder:\n{folder_path}\n\n"
+            f"Affected files:\n{file_list}\n\n"
+            f"EchoList needs to update the album artist, album name, and track "
+            f"numbers on these files so they appear correctly on the device.\n\n"
+            f"A backup of the original metadata will be saved so you can "
+            f"restore it later (Playlists menu > playlist name > Restore).\n\n"
+            f"Make sure this is not your only copy of these files.\n\n"
+            f"Update metadata now?",
+        )
+        if result:
+            pid = self.current_pid
+            pl = self.mgr.store.playlists[pid]
+
+            def fix():
+                return self.mgr.fix_playlist_metadata(pid)
+
+            def on_done(fixed):
+                self._refresh_playlists_menu()
+                self.fix_meta_btn.pack_forget()
+                self._refresh_tracks()
+                if fixed:
+                    messagebox.showinfo(
+                        "Metadata updated",
+                        f"Updated metadata on {fixed} track(s).\n\n"
+                        f"A restore point has been saved. Use the Playlists menu "
+                        f"to restore if needed.",
+                    )
+
+            self._run_playlist_op(pid, pl["name"], fix, on_done)
+
+    def _offer_adopt_playlist(self, info: dict):
+        folder = info["folder"]
+        count = info["track_count"]
+        folder_path = self.mgr.writer.root / folder
+        result = messagebox.askyesno(
+            "Imported playlist detected",
+            f"The folder '{folder}' contains {count} audio file(s) but wasn't "
+            f"created by EchoList.\n\n"
+            f"Location:\n{folder_path}\n\n"
+            f"To make this playlist work on the device, EchoList needs to "
+            f"modify the metadata (album artist, album, track numbers) on "
+            f"these files.\n\n"
+            f"A restore point will be saved with the original metadata "
+            f"so you can undo this later.\n\n"
+            f"Adopt this playlist?",
+        )
+        if not result:
+            return
+
+        pid = playlist_id(folder)
+        iid = f"_imported:{folder}"
+        try:
+            self.playlist_tree.delete(iid)
+        except Exception:
+            pass
+        self.playlist_tree.insert("", "end", iid=pid, values=(folder,))
+
+        def adopt():
+            return self.mgr.adopt_playlist(folder)
+
+        def on_done(_result):
+            self.current_pid = pid
+            self._refresh_playlists()
+            self._update_status()
+            messagebox.showinfo(
+                "Playlist adopted",
+                f"'{folder}' is now managed by EchoList.\n\n"
+                f"A 'before_echolist' restore point has been saved in the "
+                f"Playlists menu.",
+            )
+
+        self._run_playlist_op(pid, folder, adopt, on_done)
 
     def _create_playlist(self):
         temp_name = "New Playlist"
@@ -1197,17 +1790,46 @@ class App:
                                    f"Delete playlist '{pl['name']}'?\n\n"
                                    "This will remove the playlist folder and all the\n"
                                    "tracks that were copied into it.\n"
-                                   "Your original music files are never touched."):
+                                   "Your original music files are never touched.\n\n"
+                                   "A restore point will be saved so you can bring it back."):
             return
-        try:
-            self.mgr.writer.delete(pl["folder"])
-        except Exception:
-            pass
-        del self.mgr.store.playlists[self.current_pid]
-        self.mgr.store.save()
+        pid = self.current_pid
+        name = pl["name"]
         self.current_pid = None
-        self._refresh_playlists()
-        self._update_status()
+
+        def delete():
+            try:
+                self.mgr.backup_playlist_metadata(pid)
+            except Exception:
+                pass
+            try:
+                self.mgr.writer.delete(pl["folder"])
+            except Exception:
+                pass
+            del self.mgr.store.playlists[pid]
+            self.mgr.store.save()
+
+        def on_done(_result):
+            self._refresh_playlists()
+            self._update_status()
+
+        self._run_playlist_op(pid, name, delete, on_done)
+
+    # TODO: star prefix feature disabled — re-enable when stable
+    # def _toggle_star_prefix(self):
+    #     enabled = self._star_var.get()
+    #     self._star_cb.config(state="disabled", fg=FG_DIM)
+    #     self.mgr.set_star_prefix(enabled)
+    #     self._refresh_playlists()
+    #     self._update_status()
+    #     self._poll_star_rename()
+
+    # def _poll_star_rename(self):
+    #     thread = getattr(self.mgr, "_star_rename_thread", None)
+    #     if thread and thread.is_alive():
+    #         self.root.after(50, self._poll_star_rename)
+    #     else:
+    #         self._star_cb.config(state="normal", fg=FG)
 
     # ── Tracks ──
 
@@ -1217,6 +1839,7 @@ class App:
             self._track_data = []
             self._removed_data = []
             return
+        self.mgr.rescan_playlist(self.current_pid)
         playlist = self.mgr.store.playlists[self.current_pid]
         active, removed = self.staging.virtual_tracks(self.current_pid, playlist["tracks"])
 

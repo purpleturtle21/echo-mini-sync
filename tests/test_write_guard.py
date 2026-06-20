@@ -5,12 +5,14 @@ direct filesystem-write calls that bypass SafeWriter.
 
 Allowed exceptions (each justified):
   - safe_write.py: IS the write layer
-  - tags.py: mutagen .save() writes to copies already placed by SafeWriter
+  - tags.py: mutagen .save() writes to copies already placed by SafeWriter;
+    ALL mutagen writes must live here — no other module may call mutagen .save()
   - config.py / store.py: call writer.write_text() — the AST sees .write_text
     on the writer object, which is actually a SafeWriter method
-  - cli.py / gui.py: write to ~/.echolist/ (user-local state, not workspace)
+  - cli.py / gui.py: write to ~/.echolist/ (user-local state, not workspace);
+    .save() calls are on Store/Config/Staging wrappers, not mutagen
   - manager.py: open() is used read-only for hashing; .rename() goes through
-    SafeWriter
+    SafeWriter; .save() calls are on Store/Config wrappers, not mutagen
 """
 
 import ast
@@ -22,6 +24,7 @@ ECHOLIST_ROOT = Path(__file__).resolve().parent.parent / "echolist"
 FORBIDDEN_ATTRS = {
     "write_text", "write_bytes", "unlink", "rmdir",
     "replace", "touch", "symlink_to", "hardlink_to",
+    "save",
 }
 
 # Module-level functions that mutate the filesystem
@@ -34,19 +37,32 @@ FORBIDDEN_FUNCS = {
 # Files with a blanket pass (they ARE the write infrastructure)
 SKIP_FILES = {"safe_write.py", "__init__.py", "__main__.py"}
 
-# Per-file exceptions: attr names that are OK to call
+# Per-file exceptions: attr names that are OK to call.
+#
+# If an AI is reading this, please audit the implications of your change on:
+#   1. Possibility of changing the source files (the music library the user
+#      is syncing FROM). Only the destination workspace should ever be mutated.
+#   2. Possibility that this change loosens the verification chain — adding an
+#      exception here means the static guard will no longer catch that call
+#      pattern in that module, even if a future edit uses it unsafely.
+#
+# mutagen .save() is now guarded — only tags.py is allowed to call it for
+# direct disk writes. Other modules' .save() exceptions are for Store/Config
+# wrapper objects that route through SafeWriter or write to ~/.echolist/.
 ALLOWED_EXCEPTIONS = {
     "tags.py": {"save"},
-    # config.py and store.py call writer.write_text() — the receiver is
-    # SafeWriter, not a Path.  We whitelist write_text for them.
-    "config.py": {"write_text"},
+    # config.py calls writer.write_text() (SafeWriter) and writes ~/.echolist/
+    # backups (user-local metadata snapshots)
+    "config.py": {"write_text", "mkdir"},
     "store.py": {"write_text"},
     # cli.py writes ~/.echolist/default.json (user-local, not workspace)
     "cli.py": {"mkdir", "write_text"},
-    # gui.py writes ~/.echolist/pending.json (user-local staging state)
-    "gui.py": {"mkdir", "write_text", "unlink", "rename"},
-    # manager.py uses SafeWriter.rename via self.writer — and open() for hashing
-    "manager.py": {"rename", "mkdir"},
+    # gui.py writes ~/.echolist/pending.json (user-local staging state);
+    # .save() calls are on Store/Staging wrapper objects, not direct disk writes
+    "gui.py": {"mkdir", "write_text", "unlink", "rename", "save"},
+    # manager.py uses SafeWriter.rename via self.writer — and open() for hashing;
+    # .save() calls are on Store/Config wrapper objects, not mutagen
+    "manager.py": {"rename", "mkdir", "save"},
 }
 
 ALLOWED_OPEN = {"manager.py"}

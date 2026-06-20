@@ -1,5 +1,6 @@
 """GUI tests — exercises App logic via tkinter without user interaction."""
 
+import time
 import tkinter as tk
 import pytest
 from pathlib import Path
@@ -8,6 +9,15 @@ from unittest.mock import patch
 from echolist.gui import App, StagingState, _read_tags_from_file, PENDING_FILE
 from echolist.manager import PlaylistManager
 from conftest import _make_flac, assert_originals_untouched
+
+
+def _flush_bg_ops(app, timeout=10):
+    """Wait for all background playlist ops to finish and process callbacks."""
+    deadline = time.monotonic() + timeout
+    while app._busy_playlists and time.monotonic() < deadline:
+        app.root.update()
+        time.sleep(0.05)
+    app.root.update()
 
 
 @pytest.fixture
@@ -151,6 +161,7 @@ class TestAppPlaylist:
         assert len(app.mgr.store.playlists) == 1
         with patch("echolist.gui.messagebox.askyesno", return_value=True):
             app._delete_playlist()
+        _flush_bg_ops(app)
         assert len(app.mgr.store.playlists) == 0
 
     def test_delete_cancelled(self, app):
