@@ -631,6 +631,137 @@ class TestM3uImport:
         assert (app.mgr.writer.root / folder / tracks[0]["copy_name"]).exists()
 
 
+class TestPlaylistRename:
+    """Test inline rename and its interaction with backups."""
+
+    def _do_rename(self, app, old_pid, new_name):
+        """Simulate the commit() logic from _start_inline_rename."""
+        from echolist.naming import playlist_id, sanitize
+        new_pid = playlist_id(new_name)
+        pl = app.mgr.store.playlists[old_pid]
+        old_folder = pl["folder"]
+        new_folder = sanitize(new_name)
+        if old_folder != new_folder:
+            app.mgr.writer.rename(old_folder, new_folder)
+        pl["name"] = new_name
+        pl["folder"] = new_folder
+        if new_pid != old_pid:
+            from echolist.config import rename_backup_pid
+            app.mgr.store.playlists[new_pid] = pl
+            del app.mgr.store.playlists[old_pid]
+            app.current_pid = new_pid
+            rename_backup_pid(app.mgr.writer.root, old_pid, new_pid, new_folder)
+        app._invalidate_caches(new_pid if new_pid != old_pid else old_pid)
+        app.mgr.store.save()
+        return new_pid
+
+    def test_rename_changes_folder_and_store(self, app, gui_env):
+        """Basic rename updates name, folder, and pid in the store."""
+        app._create_playlist()
+        old_pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        new_pid = self._do_rename(app, old_pid, "Renamed Playlist")
+
+        assert old_pid not in app.mgr.store.playlists
+        assert new_pid in app.mgr.store.playlists
+        assert app.current_pid == new_pid
+        pl = app.mgr.store.playlists[new_pid]
+        assert pl["name"] == "Renamed Playlist"
+        assert (app.mgr.writer.root / pl["folder"]).is_dir()
+        # Track files should exist in the new folder
+        for t in pl["tracks"]:
+            assert (app.mgr.writer.root / pl["folder"] / t["copy_name"]).exists()
+
+    def test_rename_same_pid(self, app, gui_env):
+        """Rename that doesn't change pid (e.g. case change) keeps old pid."""
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        # "New Playlist" -> "new playlist" — same pid
+        result_pid = self._do_rename(app, pid, "new playlist")
+        assert result_pid == pid
+        assert pid in app.mgr.store.playlists
+        assert app.mgr.store.playlists[pid]["name"] == "new playlist"
+
+    def test_rename_preserves_backups(self, app, gui_env):
+        """Backups created before rename are accessible under the new pid."""
+        from echolist.config import list_backups, load_backup
+        app._create_playlist()
+        old_pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        # Create backup under old pid
+        app.mgr.backup_playlist_metadata(old_pid)
+        assert len(list_backups(app.mgr.writer.root, old_pid)) == 1
+
+        # Rename
+        new_pid = self._do_rename(app, old_pid, "Fresh Name")
+
+        # Backups should be under new pid
+        assert list_backups(app.mgr.writer.root, old_pid) == []
+        new_backups = list_backups(app.mgr.writer.root, new_pid)
+        assert len(new_backups) == 1
+
+        # Backup folder field should be updated
+        data = load_backup(app.mgr.writer.root, new_pid, new_backups[0]["timestamp"])
+        pl = app.mgr.store.playlists[new_pid]
+        assert data["folder"] == pl["folder"]
+
+    def test_rename_then_restore_works(self, app, gui_env):
+        """Full flow: create → sync → backup → rename → corrupt → restore."""
+        app._create_playlist()
+        old_pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        app.mgr.backup_playlist_metadata(old_pid)
+        new_pid = self._do_rename(app, old_pid, "Restored Later")
+
+        # Corrupt the tags
+        pl = app.mgr.store.playlists[new_pid]
+        track_path = app.mgr.writer.root / pl["folder"] / pl["tracks"][0]["copy_name"]
+        from mutagen.flac import FLAC
+        f = FLAC(track_path)
+        f["ALBUM"] = "CORRUPTED"
+        f.save()
+
+        # Restore should work under new pid
+        restored = app.mgr.restore_playlist_metadata(new_pid)
+        assert restored == 1
+
+        from echolist.tags import read_playlist_tags
+        tags = read_playlist_tags(track_path)
+        assert tags["album"] != "CORRUPTED"
+
+    def test_rename_audit_flags_old_album(self, app, gui_env):
+        """After rename, audit should flag that album tag doesn't match new name."""
+        app._create_playlist()
+        old_pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        new_pid = self._do_rename(app, old_pid, "Totally Different")
+
+        issues = app.mgr.audit_playlist_metadata(new_pid)
+        album_issues = [i for i in issues if i["field"] == "album"]
+        assert len(album_issues) >= 1
+
+
 class TestSourceRoot:
     """Test that the GUI correctly handles source_root, including mismatches."""
 

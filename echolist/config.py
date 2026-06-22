@@ -77,6 +77,44 @@ def list_all_backup_pids(workspace_root: str | Path) -> list[str]:
     )
 
 
+def rename_backup_pid(workspace_root: str | Path, old_pid: str, new_pid: str,
+                      new_folder: str | None = None) -> None:
+    """Move all backups from old_pid to new_pid directory.
+
+    If new_folder is provided, update the 'folder' field inside each backup
+    so restore operations look in the correct location.
+    """
+    if old_pid == new_pid:
+        return
+    for pid in (old_pid, new_pid):
+        if not pid or ".." in pid or "/" in pid or "\\" in pid:
+            raise ValueError(f"invalid playlist id: {pid!r}")
+    wid = _workspace_id(workspace_root)
+    old_dir = (BACKUPS_ROOT / wid / old_pid).resolve()
+    if not str(old_dir).startswith(str(BACKUPS_ROOT.resolve())):
+        raise ValueError(f"backup path escapes backups root: {old_dir}")
+    if not old_dir.exists():
+        return
+    new_dir = BACKUPS_ROOT / wid / new_pid
+    new_dir.mkdir(parents=True, exist_ok=True)
+    for f in old_dir.iterdir():
+        if f.is_file() and f.suffix == ".json":
+            if new_folder:
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    data["folder"] = new_folder
+                    _atomic_write_text(new_dir / f.name, json.dumps(data, indent=2))
+                    f.unlink()
+                except Exception:
+                    f.rename(new_dir / f.name)
+            else:
+                f.rename(new_dir / f.name)
+    try:
+        old_dir.rmdir()
+    except OSError:
+        pass
+
+
 def delete_all_backups(workspace_root: str | Path, pid: str) -> None:
     """Permanently remove all backup files for a playlist.
 

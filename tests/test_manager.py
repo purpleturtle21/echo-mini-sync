@@ -1092,3 +1092,88 @@ def test_adopt_m4a_playlist_tracknumbers(manager):
 
     # After adopt, audit should be clean — no persistent mismatch
     assert manager.audit_playlist_metadata(pid) == []
+
+
+# ── Rename + backup interaction ──
+
+def test_rename_preserves_backups(manager, source):
+    """create → backup → rename → backup should be accessible under new pid."""
+    from echolist.config import rename_backup_pid, list_backups, load_backup
+    from echolist.naming import playlist_id, sanitize
+
+    pid = manager.create_playlist("Morning Vibes")
+    src = source / "ArtistA" / "Album1" / "01 Song One.flac"
+    manager.add_track(pid, src)
+
+    # Create a backup under old pid
+    manager.backup_playlist_metadata(pid)
+    assert len(list_backups(manager.writer.root, pid)) == 1
+
+    # Simulate rename (same logic as gui commit)
+    new_name = "Evening Vibes"
+    new_pid = playlist_id(new_name)
+    new_folder = sanitize(new_name)
+    pl = manager.store.playlists[pid]
+    old_folder = pl["folder"]
+
+    manager.writer.rename(old_folder, new_folder)
+    pl["name"] = new_name
+    pl["folder"] = new_folder
+    manager.store.playlists[new_pid] = pl
+    del manager.store.playlists[pid]
+    manager.store.save()
+
+    # Migrate backups
+    rename_backup_pid(manager.writer.root, pid, new_pid, new_folder)
+
+    # Old pid should have no backups, new pid should have them
+    assert list_backups(manager.writer.root, pid) == []
+    backups = list_backups(manager.writer.root, new_pid)
+    assert len(backups) == 1
+
+    # The backup should reference the new folder
+    data = load_backup(manager.writer.root, new_pid, backups[0]["timestamp"])
+    assert data["folder"] == new_folder
+
+
+def test_rename_backup_restore_works(manager, source):
+    """Full flow: create → add → backup → rename → modify tags → restore."""
+    from echolist.config import rename_backup_pid
+    from echolist.naming import playlist_id, sanitize
+    from echolist.tags import read_playlist_tags
+
+    pid = manager.create_playlist("Road Trip")
+    src = source / "ArtistA" / "Album1" / "01 Song One.flac"
+    manager.add_track(pid, src)
+
+    # Backup original state
+    manager.backup_playlist_metadata(pid)
+
+    # Rename
+    new_name = "Highway Jams"
+    new_pid = playlist_id(new_name)
+    new_folder = sanitize(new_name)
+    pl = manager.store.playlists[pid]
+    old_folder = pl["folder"]
+    manager.writer.rename(old_folder, new_folder)
+    pl["name"] = new_name
+    pl["folder"] = new_folder
+    manager.store.playlists[new_pid] = pl
+    del manager.store.playlists[pid]
+    manager.store.save()
+    rename_backup_pid(manager.writer.root, pid, new_pid, new_folder)
+
+    # Modify tags (simulate corruption)
+    track = manager.store.playlists[new_pid]["tracks"][0]
+    track_path = manager.writer.root / new_folder / track["copy_name"]
+    f = FLAC(track_path)
+    f["ALBUM"] = "WRONG ALBUM"
+    f.save()
+
+    # Restore from backup — should work under new pid/folder
+    restored = manager.restore_playlist_metadata(new_pid)
+    assert restored == 1
+
+    # Verify tags were restored
+    tags = read_playlist_tags(track_path)
+    assert tags["album"] != "WRONG ALBUM"

@@ -2546,17 +2546,25 @@ class App:
             pl = self.mgr.store.playlists[pid]
             old_folder = pl["folder"]
             new_folder = sanitize(new_name)
-            pl["name"] = new_name
-            pl["folder"] = new_folder
-            if new_pid != pid:
-                self.mgr.store.playlists[new_pid] = pl
-                del self.mgr.store.playlists[pid]
-                self.current_pid = new_pid
+
+            # Rename folder on disk first — abort if it fails
             if old_folder != new_folder:
                 try:
                     self.mgr.writer.rename(old_folder, new_folder)
-                except Exception:
-                    pass
+                except Exception as e:
+                    messagebox.showerror("Rename failed",
+                                         f"Could not rename folder on device:\n{e}")
+                    return
+
+            pl["name"] = new_name
+            pl["folder"] = new_folder
+            if new_pid != pid:
+                from .config import rename_backup_pid
+                self.mgr.store.playlists[new_pid] = pl
+                del self.mgr.store.playlists[pid]
+                self.current_pid = new_pid
+                rename_backup_pid(self.mgr.writer.root, pid, new_pid, new_folder)
+            self._invalidate_caches(new_pid if new_pid != pid else pid)
             self.mgr.store.save()
             self._refresh_playlists()
             self._update_status()
