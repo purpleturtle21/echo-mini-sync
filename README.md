@@ -68,7 +68,7 @@ Artists                          Albums
 - **Source search** — filter your library inline to find tracks fast
 - **Undo** — undo staged changes before syncing
 - **Track context menu** — right-click a track to jump to its source file or see which playlists it's in
-- **Cross-platform** — Windows, Linux, macOS (macOS untested)
+- **Cross-platform** — Windows, Linux, macOS (macOS may be unstable)
 
 ---
 

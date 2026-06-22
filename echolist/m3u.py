@@ -19,7 +19,7 @@ def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
     try:
         lines = m3u_path.read_text(encoding=encoding).splitlines()
     except UnicodeDecodeError:
-        lines = m3u_path.read_text(encoding="latin-1").splitlines()
+        lines = m3u_path.read_text(encoding="cp1252").splitlines()
 
     tracks: list[Path] = []
     missing: list[str] = []
