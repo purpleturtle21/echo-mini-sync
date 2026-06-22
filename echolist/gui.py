@@ -1207,6 +1207,7 @@ class App:
                 else:
                     missing.append(src_path)
 
+            self._invalidate_caches(pid)
             self._refresh_playlists()
             self._refresh_tracks()
             self._update_status()
@@ -1263,6 +1264,7 @@ class App:
                 else:
                     missing.append(src_path)
 
+            self._invalidate_caches(pid)
             self._refresh_playlists()
             self._update_status()
 
