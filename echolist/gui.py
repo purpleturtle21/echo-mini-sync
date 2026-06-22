@@ -1526,6 +1526,7 @@ class App:
 
         is_offloaded = pl.get("offloaded", False)
         has_pending = self._playlist_has_pending(iid)
+        has_orphans = any(not t.get("src_path") for t in pl.get("tracks", []))
 
         menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG,
                        activebackground=RED_DARK, activeforeground=FG_BRIGHT)
@@ -1536,9 +1537,12 @@ class App:
             menu.add_command(label="Reindex",
                             command=lambda: self._reindex_playlist(iid),
                             state="normal" if pl.get("tracks") and not is_offloaded else "disabled")
-            menu.add_command(label="Offload (remove from device)",
+            can_offload = not has_pending and not has_orphans
+            offload_label = ("Offload (has tracks without source)"
+                             if has_orphans else "Offload (remove from device)")
+            menu.add_command(label=offload_label,
                             command=lambda: self._offload_playlist(iid),
-                            state="normal" if not has_pending else "disabled")
+                            state="normal" if can_offload else "disabled")
         menu.add_separator()
         menu.add_command(label="Rename", command=lambda: self._start_inline_rename(iid))
         menu.add_command(label="Delete", command=self._delete_playlist)
@@ -1557,6 +1561,8 @@ class App:
     def _offload_playlist(self, pid: str):
         pl = self.mgr.store.playlists.get(pid)
         if not pl:
+            return
+        if any(not t.get("src_path") for t in pl.get("tracks", [])):
             return
         name = pl["name"]
         confirm = messagebox.askyesno(
@@ -2990,6 +2996,23 @@ class App:
 
         if committed_keys:
             playlist = self.mgr.store.playlists[self.current_pid]
+            orphan_count = 0
+            for k in committed_keys:
+                orig_idx = int(k.split(":")[1])
+                for t in playlist["tracks"]:
+                    if t["index"] == orig_idx and not t.get("src_path"):
+                        orphan_count += 1
+            if orphan_count:
+                proceed = messagebox.askyesno(
+                    "Track has no source",
+                    f"{orphan_count} selected track(s) have no source file "
+                    f"(e.g. from an adopted folder).\n\n"
+                    f"Removing them is permanent — they can't be re-added "
+                    f"without the original file.\n\n"
+                    f"Continue?",
+                )
+                if not proceed:
+                    return
             for k in committed_keys:
                 orig_idx = int(k.split(":")[1])
                 copy_name = ""
