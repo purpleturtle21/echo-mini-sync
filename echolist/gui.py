@@ -1392,6 +1392,17 @@ class App:
         pl = self.mgr.store.playlists.get(self.current_pid)
         return bool(pl and pl.get("offloaded"))
 
+    def _show_popup_menu(self, menu, event):
+        """Show a context menu and ensure any previous one is dismissed."""
+        if hasattr(self, "_popup_menu") and self._popup_menu:
+            try:
+                self._popup_menu.unpost()
+                self._popup_menu.destroy()
+            except Exception:
+                pass
+        self._popup_menu = menu
+        menu.tk_popup(event.x_root, event.y_root)
+
     def _track_context_menu(self, event):
         if self._current_playlist_offloaded():
             return
@@ -1413,7 +1424,7 @@ class App:
         menu.add_command(label="Show in playlists",
                          command=lambda: self._show_track_in_playlists(src_path),
                          state="normal" if src_path else "disabled")
-        menu.post(event.x_root, event.y_root)
+        self._show_popup_menu(menu, event)
 
     def _show_track_in_source(self, src_path: str):
         if not src_path:
@@ -1529,7 +1540,7 @@ class App:
         menu.add_separator()
         menu.add_command(label="Rename", command=lambda: self._start_inline_rename(iid))
         menu.add_command(label="Delete", command=self._delete_playlist)
-        menu.post(event.x_root, event.y_root)
+        self._show_popup_menu(menu, event)
 
     def _reindex_playlist(self, pid: str):
         pl = self.mgr.store.playlists.get(pid)
