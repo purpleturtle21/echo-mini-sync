@@ -117,7 +117,8 @@ def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
     Resolution order:
     1. Relative to source_root (the normal case)
     2. As an absolute path (if src_path is absolute)
-    3. Just the filename, searched directly under source_root subfolders
+    3. Relative to ancestors of source_root (handles changed source root)
+    4. Just the filename, searched under source_root and its parent
     Returns None if not found anywhere.
     """
     if not src_path:
@@ -134,14 +135,29 @@ def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
     if p.is_absolute() and p.exists():
         return p.resolve()
 
-    # 3. Filename search under source_root (handles moved files)
+    # 3. Try ancestors of source_root (up to 3 levels)
+    if not p.is_absolute():
+        ancestor = source_root
+        for _ in range(3):
+            ancestor = ancestor.parent
+            if ancestor == ancestor.parent:
+                break
+            candidate = ancestor / p
+            if candidate.exists():
+                return candidate.resolve()
+
+    # 4. Filename search under source_root and its parent
     name = p.name
-    try:
-        for hit in source_root.rglob(name):
-            if hit.is_file():
-                return hit.resolve()
-    except OSError:
-        pass
+    search_roots = [source_root]
+    if source_root.parent != source_root:
+        search_roots.append(source_root.parent)
+    for root in search_roots:
+        try:
+            for hit in root.rglob(name):
+                if hit.is_file():
+                    return hit.resolve()
+        except OSError:
+            pass
 
     return None
 

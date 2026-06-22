@@ -1297,6 +1297,21 @@ class TestTrackContextMenu:
             app._show_track_in_source("nonexistent/file.flac")
         mock.assert_called_once()
 
+    def test_show_in_source_finds_file_outside_source_root(self, app, gui_env):
+        """If source_root changed, file outside it should still be found
+        by walking up ancestors."""
+        from echolist.gui import _resolve_source_file
+        src = gui_env["src"]
+        # File is at src/ArtistA/Album1/01 Song One.flac
+        # Set source_root to a sibling directory
+        sibling = src / "ArtistB"
+        full = _resolve_source_file(
+            "ArtistA/Album1/01 Song One.flac",
+            sibling.resolve(),
+        )
+        assert full is not None
+        assert full.name == "01 Song One.flac"
+
     def test_show_in_source_lazy_loads_unexpanded_folder(self, app, gui_env):
         """Show in source must expand lazy-loaded folders to reach the file."""
         app._create_playlist()
