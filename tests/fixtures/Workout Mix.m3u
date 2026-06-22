@@ -1,0 +1,5 @@
+#EXTM3U
+#EXTINF:240,ArtistA - Song One
+ArtistA\Album1\01 Song One.flac
+#EXTINF:195,ArtistB - Song Two
+ArtistB\Album2\03 Song Two.flac

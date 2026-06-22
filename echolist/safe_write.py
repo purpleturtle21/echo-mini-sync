@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -31,13 +33,13 @@ class SafeWriter:
     def write_text(self, rel, text) -> Path:
         p = self._resolve(rel)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text, encoding="utf-8")
+        _atomic_write(p, text.encode("utf-8"))
         return p
 
     def write_bytes(self, rel, data) -> Path:
         p = self._resolve(rel)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
+        _atomic_write(p, data)
         return p
 
     def copy_in(self, src, rel, progress_cb=None, compute_hash=False):
@@ -83,3 +85,27 @@ class SafeWriter:
 
     def resolve(self, rel) -> Path:
         return self._resolve(rel)
+
+
+def _atomic_write(dest: Path, data: bytes) -> None:
+    """Write data to dest atomically via temp-file + os.replace."""
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, dest)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(dest: Path, text: str) -> None:
+    """Write text to dest atomically. Safe for use outside the workspace."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(dest, text.encode("utf-8"))

@@ -9,6 +9,7 @@ import pytest
 from mutagen.flac import FLAC
 
 from echolist.manager import PlaylistManager
+import echolist.config as _config
 
 # Minimal valid FLAC (1 sample, 44100 Hz, 16-bit mono) — no ffmpeg needed.
 TINY_FLAC = base64.b64decode(
@@ -25,6 +26,12 @@ def _make_flac(path: Path, artist: str, title: str) -> None:
     f["ALBUM"] = "Test Album"
     f["TRACKNUMBER"] = "1"
     f.save()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_backups(tmp_path, monkeypatch):
+    """Redirect BACKUPS_ROOT to a temp dir so tests don't pollute ~/.echolist/."""
+    monkeypatch.setattr(_config, "BACKUPS_ROOT", tmp_path / "backups")
 
 
 @pytest.fixture
@@ -46,7 +53,8 @@ def dest(tmp_path):
 @pytest.fixture
 def manager(source, dest):
     mgr = PlaylistManager.init(source, dest)
-    return mgr
+    yield mgr
+    mgr.release_lock()
 
 
 def _hash_file(p: Path) -> str:

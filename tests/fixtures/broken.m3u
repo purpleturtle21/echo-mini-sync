@@ -1,0 +1,5 @@
+#EXTM3U
+#EXTINF:200,Missing - Gone
+nonexistent/path/missing.flac
+#EXTINF:240,ArtistA - Song One
+ArtistA/Album1/01 Song One.flac
