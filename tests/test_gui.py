@@ -1118,7 +1118,37 @@ class TestOffloadOnload:
         assert pl["tracks"] == []
         assert not folder_path.exists()
 
-    def test_onload_stages_tracks_from_backup(self, app, gui_env):
+    def _do_onload(self, app, pid):
+        """Simulate onload logic inline (avoids threading complexity in tests)."""
+        from echolist.config import load_backup, list_backups
+        from echolist.gui import _resolve_source_file, _read_tags_from_file
+
+        backups = list_backups(app.mgr.writer.root, pid)
+        assert len(backups) >= 1
+        data = load_backup(app.mgr.writer.root, pid, backups[0]["timestamp"])
+        assert data is not None
+
+        pl = app.mgr.store.playlists[pid]
+        pl["offloaded"] = False
+        pl["tracks"] = []
+        app.mgr.store.save()
+
+        folder = pl["folder"]
+        (app.mgr.writer.root / folder).mkdir(parents=True, exist_ok=True)
+
+        source_root = Path(app.mgr.config.source_root)
+        for entry in data.get("tracks", []):
+            src_path = entry.get("src_path", "")
+            if not src_path:
+                continue
+            full = _resolve_source_file(src_path, source_root)
+            if full:
+                title, artist = _read_tags_from_file(full)
+                app.staging.stage_add(pid, str(full), title, artist)
+        app._invalidate_caches(pid)
+
+    def test_onload_stages_tracks_for_sync(self, app, gui_env):
+        """Onload must stage tracks from backup for re-syncing."""
         app._create_playlist()
         pid = app.current_pid
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
@@ -1130,32 +1160,48 @@ class TestOffloadOnload:
             app._offload_playlist(pid)
         _flush_bg_ops(app)
 
-        assert app.mgr.store.playlists[pid]["offloaded"] is True
+        assert app.mgr.store.playlists[pid]["tracks"] == []
 
-        # Test onload logic directly (avoids threading complexity in tests)
-        from echolist.config import load_backup, list_backups
-        backups = list_backups(app.mgr.writer.root, pid)
-        assert len(backups) >= 1
-        data = load_backup(app.mgr.writer.root, pid, backups[0]["timestamp"])
-        assert data is not None
+        # Onload — tracks staged, not yet on device
+        self._do_onload(app, pid)
 
         pl = app.mgr.store.playlists[pid]
-        pl["offloaded"] = False
-        app.mgr.store.save()
-        source_root = Path(app.mgr.config.source_root)
-        for entry in data.get("tracks", []):
-            src_path = entry.get("src_path", "")
-            if not src_path:
-                continue
-            full = source_root / src_path
-            if full.exists():
-                from echolist.gui import _read_tags_from_file
-                title, artist = _read_tags_from_file(full)
-                app.staging.stage_add(pid, str(full), title, artist)
-
         assert pl.get("offloaded") is False
         assert len(app.staging.pending_adds) >= 1
         assert any(a["pid"] == pid for a in app.staging.pending_adds)
+
+    def test_offload_onload_sync_roundtrip(self, app, gui_env):
+        """Full cycle: sync → offload → onload → sync → files back on device."""
+        app._create_playlist()
+        pid = app.current_pid
+        src1 = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        src2 = gui_env["src"] / "ArtistB" / "Album2" / "03 Song Two.flac"
+        app._stage_add_files([src1, src2])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        pl = app.mgr.store.playlists[pid]
+        folder = pl["folder"]
+        assert len(pl["tracks"]) == 2
+
+        # Offload
+        with patch("echolist.gui.messagebox.askyesno", return_value=True):
+            app._offload_playlist(pid)
+        _flush_bg_ops(app)
+        assert not (app.mgr.writer.root / folder).exists()
+
+        # Onload
+        self._do_onload(app, pid)
+
+        # Sync to copy files back
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        # Tracks should be back on device
+        pl = app.mgr.store.playlists[pid]
+        assert len(pl["tracks"]) == 2
+        for t in pl["tracks"]:
+            assert (app.mgr.writer.root / folder / t["copy_name"]).exists()
 
 
 class TestSourceSearch:

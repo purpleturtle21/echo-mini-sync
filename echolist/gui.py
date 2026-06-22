@@ -1608,24 +1608,37 @@ class App:
 
         def on_done(tracks):
             pl["offloaded"] = False
+            pl["tracks"] = []
             self.mgr.store.save()
-            self._invalidate_caches(pid)
+
+            # Recreate the folder so sync can write into it
+            folder = pl["folder"]
+            try:
+                (self.mgr.writer.root / folder).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            # Stage all tracks for re-copying from source
             source_root = Path(self.mgr.config.source_root)
+            staged = 0
             missing = []
             for entry in tracks:
                 src_path = entry.get("src_path", "")
                 if not src_path:
+                    missing.append(entry.get("copy_name", "(unknown)"))
                     continue
                 full = _resolve_source_file(src_path, source_root)
                 if full:
                     title, artist = _read_tags_from_file(full)
                     self.staging.stage_add(pid, str(full), title, artist)
+                    staged += 1
                 else:
                     missing.append(src_path)
+
+            self._invalidate_caches(pid)
             self._refresh_playlists()
             self._refresh_tracks()
             self._update_status()
-            staged = len(tracks) - len(missing)
             parts = []
             if staged:
                 parts.append(f"Staged {staged} track(s) for syncing.")
