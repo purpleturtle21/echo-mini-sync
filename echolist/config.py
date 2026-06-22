@@ -77,6 +77,29 @@ def list_all_backup_pids(workspace_root: str | Path) -> list[str]:
     )
 
 
+def delete_all_backups(workspace_root: str | Path, pid: str) -> None:
+    """Permanently remove all backup files for a playlist.
+
+    Only deletes .json files from ~/.echolist/backups/{wid}/{pid}/.
+    Validates the resolved path is inside BACKUPS_ROOT to prevent traversal.
+    """
+    if not pid or ".." in pid or "/" in pid or "\\" in pid:
+        raise ValueError(f"invalid playlist id: {pid!r}")
+    wid = _workspace_id(workspace_root)
+    backup_dir = (BACKUPS_ROOT / wid / pid).resolve()
+    if not str(backup_dir).startswith(str(BACKUPS_ROOT.resolve())):
+        raise ValueError(f"backup path escapes backups root: {backup_dir}")
+    if not backup_dir.exists():
+        return
+    for f in backup_dir.iterdir():
+        if f.is_file() and f.suffix == ".json":
+            f.unlink()
+    try:
+        backup_dir.rmdir()
+    except OSError:
+        pass
+
+
 def load_backup(workspace_root: str | Path, pid: str, timestamp: str) -> dict | None:
     wid = _workspace_id(workspace_root)
     p = BACKUPS_ROOT / wid / pid / f"{timestamp}.json"

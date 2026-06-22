@@ -6,7 +6,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch
 
-from echolist.gui import App, StagingState, _read_tags_from_file, PENDING_FILE
+from echolist.gui import App, StagingState, _read_tags_from_file, _resolve_source_file, PENDING_FILE
 from echolist.manager import PlaylistManager
 from conftest import _make_flac, assert_originals_untouched
 
@@ -603,6 +603,163 @@ class TestM3uImport:
         assert (app.mgr.writer.root / folder / tracks[0]["copy_name"]).exists()
 
 
+class TestSourceRoot:
+    """Test that the GUI correctly handles source_root, including mismatches."""
+
+    def test_open_workspace_uses_correct_source(self, app, gui_env):
+        """After opening, the source tree root matches config.source_root."""
+        source_root = Path(app.mgr.config.source_root)
+        assert source_root == gui_env["src"].resolve()
+
+    def test_source_mismatch_updates_config(self, gui_env, monkeypatch):
+        """Re-opening workspace from a different source updates config.source_root."""
+        src = gui_env["src"]
+        dest = gui_env["dest"]
+        mgr = gui_env["mgr"]
+
+        new_src = gui_env["tmp"] / "other_library"
+        _make_flac(new_src / "X" / "Y" / "01 Track.flac", "X", "Track")
+
+        mgr.release_lock()
+
+        test_pending = gui_env["tmp"] / "pending.json"
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
+
+        a = App.__new__(App)
+        a.root = tk.Tk()
+        a.root.withdraw()
+        a.mgr = None
+        a.source = ""
+        a.dest = ""
+        a.current_pid = None
+        a.staging = StagingState.__new__(StagingState)
+        a.staging.pending_adds = []
+        a.staging.pending_removes = []
+        a.staging.pending_reorders = {}
+        a._undo_stack = []
+        a._sort_col = None
+        a._sort_reverse = False
+        a._drag_data = None
+        a._cached_device_tracks = 0
+        a._cached_workspace_bytes = 0
+        a._stats_pending = False
+        a._alive = True
+        a._syncing = False
+        a._apply_theme()
+
+        a._open_workspace(str(new_src), str(dest))
+
+        assert a.mgr.config.source_root == str(new_src.resolve())
+        assert a.source == str(new_src)
+
+        a._alive = False
+        t = getattr(a, "_stats_thread", None)
+        if t:
+            t.join(timeout=5)
+        _flush_bg_ops(a, timeout=5)
+        a.mgr.release_lock()
+        a.root.destroy()
+
+    def test_source_tree_shows_correct_library(self, gui_env, monkeypatch):
+        """Source tree displays contents from the configured source_root, not its parent."""
+        src = gui_env["src"]
+        dest = gui_env["dest"]
+        mgr = gui_env["mgr"]
+        mgr.release_lock()
+
+        test_pending = gui_env["tmp"] / "pending.json"
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
+
+        a = App.__new__(App)
+        a.root = tk.Tk()
+        a.root.withdraw()
+        a.mgr = None
+        a.source = ""
+        a.dest = ""
+        a.current_pid = None
+        a.staging = StagingState.__new__(StagingState)
+        a.staging.pending_adds = []
+        a.staging.pending_removes = []
+        a.staging.pending_reorders = {}
+        a._undo_stack = []
+        a._sort_col = None
+        a._sort_reverse = False
+        a._drag_data = None
+        a._cached_device_tracks = 0
+        a._cached_workspace_bytes = 0
+        a._stats_pending = False
+        a._alive = True
+        a._syncing = False
+        a._apply_theme()
+
+        a._open_workspace(str(src), str(dest))
+
+        top_items = a.source_tree.get_children()
+        top_names = [a.source_tree.item(iid, "text") for iid in top_items]
+        assert "ArtistA/" in top_names
+        assert "ArtistB/" in top_names
+        assert "ArtistC/" in top_names
+
+        a._alive = False
+        t = getattr(a, "_stats_thread", None)
+        if t:
+            t.join(timeout=5)
+        _flush_bg_ops(a, timeout=5)
+        a.mgr.release_lock()
+        a.root.destroy()
+
+    def test_source_mismatch_persists_to_disk(self, gui_env, monkeypatch):
+        """After source mismatch correction, the new source is persisted in config.json."""
+        src = gui_env["src"]
+        dest = gui_env["dest"]
+        mgr = gui_env["mgr"]
+
+        new_src = gui_env["tmp"] / "moved_library"
+        _make_flac(new_src / "Z" / "W" / "01 New.flac", "Z", "New")
+
+        mgr.release_lock()
+
+        test_pending = gui_env["tmp"] / "pending.json"
+        monkeypatch.setattr("echolist.gui.PENDING_FILE", test_pending)
+
+        a = App.__new__(App)
+        a.root = tk.Tk()
+        a.root.withdraw()
+        a.mgr = None
+        a.source = ""
+        a.dest = ""
+        a.current_pid = None
+        a.staging = StagingState.__new__(StagingState)
+        a.staging.pending_adds = []
+        a.staging.pending_removes = []
+        a.staging.pending_reorders = {}
+        a._undo_stack = []
+        a._sort_col = None
+        a._sort_reverse = False
+        a._drag_data = None
+        a._cached_device_tracks = 0
+        a._cached_workspace_bytes = 0
+        a._stats_pending = False
+        a._alive = True
+        a._syncing = False
+        a._apply_theme()
+
+        a._open_workspace(str(new_src), str(dest))
+
+        a.mgr.release_lock()
+        a._alive = False
+        t = getattr(a, "_stats_thread", None)
+        if t:
+            t.join(timeout=5)
+        _flush_bg_ops(a, timeout=5)
+        a.root.destroy()
+
+        import json
+        config_path = dest / "Playlists" / ".echolist" / "config.json"
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved["source_root"] == str(new_src.resolve())
+
+
 class TestReadTags:
     def test_read_from_flac(self, gui_env):
         src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
@@ -614,3 +771,206 @@ class TestReadTags:
         title, artist = _read_tags_from_file(tmp_path / "nope.flac")
         assert title == "nope"
         assert artist == ""
+
+
+class TestPlaylistStatusIcons:
+    """Test playlist status icon and tag logic."""
+
+    def test_loaded_playlist_shows_eject(self, app, gui_env):
+        app._create_playlist()
+        pid = app.current_pid
+        pl = app.mgr.store.playlists[pid]
+        assert app._playlist_status_icon(pid, pl) == "⏏"
+
+    def test_pending_add_uses_amber_tag(self, app, gui_env):
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        assert app._playlist_has_pending(pid)
+        pl = app.mgr.store.playlists[pid]
+        assert app._playlist_status_icon(pid, pl) == "⏏"
+
+    def test_offloaded_shows_dotted_circle(self, app, gui_env):
+        app._create_playlist()
+        pid = app.current_pid
+        pl = app.mgr.store.playlists[pid]
+        pl["offloaded"] = True
+        assert app._playlist_status_icon(pid, pl) == "◌"
+
+
+class TestOffloadOnload:
+    """Test playlist offload/onload lifecycle."""
+
+    def test_offload_removes_tracks_and_sets_flag(self, app, gui_env):
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        pl = app.mgr.store.playlists[pid]
+        assert len(pl["tracks"]) == 1
+        folder_path = app.mgr.writer.root / pl["folder"]
+        assert any(folder_path.iterdir())
+
+        with patch("echolist.gui.messagebox.askyesno", return_value=True):
+            app._offload_playlist(pid)
+        _flush_bg_ops(app)
+
+        pl = app.mgr.store.playlists[pid]
+        assert pl["offloaded"] is True
+        assert pl["tracks"] == []
+        assert not folder_path.exists()
+
+    def test_onload_stages_tracks_from_backup(self, app, gui_env):
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        with patch("echolist.gui.messagebox.askyesno", return_value=True):
+            app._offload_playlist(pid)
+        _flush_bg_ops(app)
+
+        assert app.mgr.store.playlists[pid]["offloaded"] is True
+
+        # Test onload logic directly (avoids threading complexity in tests)
+        from echolist.config import load_backup, list_backups
+        backups = list_backups(app.mgr.writer.root, pid)
+        assert len(backups) >= 1
+        data = load_backup(app.mgr.writer.root, pid, backups[0]["timestamp"])
+        assert data is not None
+
+        pl = app.mgr.store.playlists[pid]
+        pl["offloaded"] = False
+        app.mgr.store.save()
+        source_root = Path(app.mgr.config.source_root)
+        for entry in data.get("tracks", []):
+            src_path = entry.get("src_path", "")
+            if not src_path:
+                continue
+            full = source_root / src_path
+            if full.exists():
+                from echolist.gui import _read_tags_from_file
+                title, artist = _read_tags_from_file(full)
+                app.staging.stage_add(pid, str(full), title, artist)
+
+        assert pl.get("offloaded") is False
+        assert len(app.staging.pending_adds) >= 1
+        assert any(a["pid"] == pid for a in app.staging.pending_adds)
+
+
+class TestSourceSearch:
+    """Test source tree search functionality."""
+
+    def test_search_filters_tree(self, app, gui_env):
+        app._src_search_placeholder = False
+        app._src_search_var.set("Song One")
+        app._do_source_search()
+        children = app.source_tree.get_children()
+        assert len(children) >= 1
+        texts = [app.source_tree.item(c, "text") for c in children]
+        assert any("Song One" in t for t in texts)
+
+    def test_empty_search_restores_tree(self, app, gui_env):
+        app._src_search_placeholder = False
+        app._src_search_var.set("Song One")
+        app._do_source_search()
+        app._src_search_var.set("")
+        app._do_source_search()
+        children = app.source_tree.get_children()
+        texts = [app.source_tree.item(c, "text") for c in children]
+        assert "ArtistA/" in texts
+
+    def test_search_no_results(self, app, gui_env):
+        app._src_search_placeholder = False
+        app._src_search_var.set("nonexistent_xyz_track")
+        app._do_source_search()
+        children = app.source_tree.get_children()
+        assert len(children) == 0
+
+
+class TestTrackContextMenu:
+    """Test track right-click features."""
+
+    def test_show_in_source_selects_file(self, app, gui_env):
+        app._create_playlist()
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+        app._refresh_tracks()
+
+        src_rel = app._track_data[0]["src_path"]
+        app._show_track_in_source(src_rel)
+
+        sel = app.source_tree.selection()
+        assert len(sel) == 1
+        selected_path = Path(app.source_tree.item(sel[0], "values")[0])
+        assert selected_path.name == "01 Song One.flac"
+
+    def test_show_in_source_missing_file(self, app, gui_env):
+        with patch("echolist.gui.messagebox.showinfo") as mock:
+            app._show_track_in_source("nonexistent/file.flac")
+        mock.assert_called_once()
+
+    def test_show_in_playlists_highlights(self, app, gui_env):
+        app._create_playlist()
+        pid = app.current_pid
+        src = gui_env["src"] / "ArtistA" / "Album1" / "01 Song One.flac"
+        app._stage_add_files([src])
+        app._do_sync_blocking()
+        _flush_bg_ops(app)
+
+        src_path = app.mgr.store.playlists[pid]["tracks"][0]["src_path"]
+        app._show_track_in_playlists(src_path)
+
+        tags = app.playlist_tree.item(pid, "tags")
+        assert "highlight" in tags
+
+
+class TestResolveSourceFile:
+    """Test _resolve_source_file read-only source resolution."""
+
+    def test_relative_to_source_root(self, gui_env):
+        src = gui_env["src"]
+        result = _resolve_source_file("ArtistA/Album1/01 Song One.flac", src)
+        assert result is not None
+        assert result.name == "01 Song One.flac"
+
+    def test_absolute_path(self, gui_env):
+        src = gui_env["src"]
+        absolute = str(src / "ArtistA" / "Album1" / "01 Song One.flac")
+        result = _resolve_source_file(absolute, src)
+        assert result is not None
+        assert result.name == "01 Song One.flac"
+
+    def test_filename_fallback_when_moved(self, gui_env):
+        """If the relative path is wrong but the file exists under source_root, find it."""
+        src = gui_env["src"]
+        result = _resolve_source_file("wrong/path/01 Song One.flac", src)
+        assert result is not None
+        assert result.name == "01 Song One.flac"
+
+    def test_returns_none_when_truly_missing(self, gui_env):
+        src = gui_env["src"]
+        result = _resolve_source_file("nonexistent_file_xyz.flac", src)
+        assert result is None
+
+    def test_empty_path_returns_none(self, gui_env):
+        result = _resolve_source_file("", gui_env["src"])
+        assert result is None
+
+    def test_never_writes(self, gui_env, tmp_path):
+        """Resolution must be read-only — no files created."""
+        src = gui_env["src"]
+        before = set(src.rglob("*"))
+        _resolve_source_file("ArtistA/Album1/01 Song One.flac", src)
+        _resolve_source_file("nonexistent.flac", src)
+        _resolve_source_file("wrong/path/01 Song One.flac", src)
+        after = set(src.rglob("*"))
+        assert before == after

@@ -26,7 +26,13 @@ def parse_m3u(m3u_path: Path, source_root: Path | None = None) -> dict:
 
     for line in lines:
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("#"):
+            if line.upper().startswith("#PLAYLIST:"):
+                name = line.split(":", 1)[1].strip() or name
+            continue
+        if line.startswith(("http://", "https://", "mms://", "rtsp://")):
             continue
 
         entry = line.translate({ord("\\"): "/"})

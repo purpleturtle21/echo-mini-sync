@@ -12,7 +12,10 @@ from mutagen.flac import FLAC
 
 from echolist.manager import PlaylistManager, WorkspaceLockError
 from echolist.safe_write import SafeWriter, atomic_write_text
-from echolist.config import load_backup, list_backups, save_backup, load_playlist_snapshot
+from echolist.config import (
+    load_backup, list_backups, save_backup, load_playlist_snapshot,
+    delete_all_backups, list_all_backup_pids,
+)
 from echolist.journal import SyncJournal
 from conftest import _make_flac, assert_originals_untouched
 
@@ -528,3 +531,210 @@ def test_multiple_restore_points_independent(manager, source):
     assert result["restored"] == 1
     assert result["removed"] == 2
     assert len(manager.store.playlists[pid]["tracks"]) == 1
+
+
+# ── Permanent deletion of backups ──
+
+class TestPermanentDelete:
+    """Verify delete_all_backups is safe, complete, and isolated."""
+
+    def test_deletes_all_backups_for_target(self, tmp_path):
+        """All backup files for the target pid are removed."""
+        src = tmp_path / "lib"
+        _make_flac(src / "A" / "B" / "01.flac", "A", "Song")
+        dest = tmp_path / "card"
+        dest.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+        mgr.create_playlist("Target")
+        mgr.add_track("target", src / "A" / "B" / "01.flac")
+
+        # Use save_backup directly to create distinct backups
+        data = {"playlist_name": "Target", "folder": "Target", "tracks": [{"x": 1}]}
+        save_backup(mgr.writer.root, "target", "point_1", data)
+        save_backup(mgr.writer.root, "target", "point_2", {**data, "tracks": [{"x": 2}]})
+
+        assert len(list_backups(mgr.writer.root, "target")) == 2
+
+        delete_all_backups(mgr.writer.root, "target")
+
+        assert list_backups(mgr.writer.root, "target") == []
+        assert "target" not in list_all_backup_pids(mgr.writer.root)
+        mgr.release_lock()
+
+    def test_other_playlists_untouched(self, tmp_path):
+        """Deleting one playlist's backups must not affect any other playlist."""
+        src = tmp_path / "lib"
+        _make_flac(src / "A" / "B" / "01.flac", "A", "Song")
+        _make_flac(src / "A" / "B" / "02.flac", "A", "Song2")
+        dest = tmp_path / "card"
+        dest.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+
+        # Create distinct backups via save_backup
+        keep_data_a = {"playlist_name": "Keep Me", "folder": "Keep Me", "tracks": [{"v": 1}]}
+        keep_data_b = {"playlist_name": "Keep Me", "folder": "Keep Me", "tracks": [{"v": 2}]}
+        save_backup(mgr.writer.root, "keep_me", "backup_a", keep_data_a)
+        save_backup(mgr.writer.root, "keep_me", "backup_b", keep_data_b)
+
+        del_data = {"playlist_name": "Delete Me", "folder": "Delete Me", "tracks": [{"v": 3}]}
+        save_backup(mgr.writer.root, "delete_me", "backup_c", del_data)
+
+        delete_all_backups(mgr.writer.root, "delete_me")
+
+        # Target is gone
+        assert list_backups(mgr.writer.root, "delete_me") == []
+        # Other playlist's backups are intact
+        keep_backups = list_backups(mgr.writer.root, "keep_me")
+        assert len(keep_backups) == 2
+        assert {b["timestamp"] for b in keep_backups} == {"backup_a", "backup_b"}
+        # Data is still loadable
+        data = load_backup(mgr.writer.root, "keep_me", "backup_a")
+        assert data is not None
+        assert data["playlist_name"] == "Keep Me"
+        mgr.release_lock()
+
+    def test_delete_nonexistent_is_noop(self, tmp_path):
+        """Deleting backups for a pid that has none doesn't crash."""
+        dest = tmp_path / "card"
+        dest.mkdir()
+        src = tmp_path / "lib"
+        src.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+        delete_all_backups(mgr.writer.root, "nonexistent_playlist")
+        mgr.release_lock()
+
+    def test_rejects_path_traversal(self, tmp_path):
+        """Pid with path separators or '..' is rejected."""
+        dest = tmp_path / "card"
+        dest.mkdir()
+        src = tmp_path / "lib"
+        src.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+        with pytest.raises(ValueError):
+            delete_all_backups(mgr.writer.root, "../../../etc")
+        with pytest.raises(ValueError):
+            delete_all_backups(mgr.writer.root, "foo/bar")
+        with pytest.raises(ValueError):
+            delete_all_backups(mgr.writer.root, "foo\\bar")
+        with pytest.raises(ValueError):
+            delete_all_backups(mgr.writer.root, "")
+        mgr.release_lock()
+
+    def test_partial_delete_leaves_no_orphan_state(self, tmp_path):
+        """Simulates interrupted deletion — remaining files are still valid."""
+        src = tmp_path / "lib"
+        src.mkdir()
+        dest = tmp_path / "card"
+        dest.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+
+        base = {"playlist_name": "Partial", "folder": "Partial"}
+        save_backup(mgr.writer.root, "partial", "t1", {**base, "tracks": [{"v": 1}]})
+        save_backup(mgr.writer.root, "partial", "t2", {**base, "tracks": [{"v": 2}]})
+        save_backup(mgr.writer.root, "partial", "t3", {**base, "tracks": [{"v": 3}]})
+
+        # Manually delete one file to simulate yanked cable mid-delete
+        backups = list_backups(mgr.writer.root, "partial")
+        assert len(backups) == 3
+        backups[0]["path"].unlink()
+
+        # Remaining backups are still valid and loadable
+        remaining = list_backups(mgr.writer.root, "partial")
+        assert len(remaining) == 2
+        for b in remaining:
+            data = load_backup(mgr.writer.root, "partial", b["timestamp"])
+            assert data is not None
+            assert isinstance(data["tracks"], list)
+
+        # Full delete still works after partial state
+        delete_all_backups(mgr.writer.root, "partial")
+        assert list_backups(mgr.writer.root, "partial") == []
+        mgr.release_lock()
+
+    def test_non_json_files_survive_delete(self, tmp_path):
+        """Only .json files are removed — any other file type is left alone."""
+        src = tmp_path / "lib"
+        _make_flac(src / "A" / "B" / "01.flac", "A", "Song")
+        dest = tmp_path / "card"
+        dest.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+        mgr.create_playlist("Mixed")
+        mgr.add_track("mixed", src / "A" / "B" / "01.flac")
+        mgr.backup_playlist_metadata("mixed", "t1")
+
+        # Plant a non-json file in the backup dir
+        from echolist.config import BACKUPS_ROOT, _workspace_id
+        wid = _workspace_id(mgr.writer.root)
+        rogue = BACKUPS_ROOT / wid / "mixed" / "notes.txt"
+        rogue.write_text("keep me")
+
+        delete_all_backups(mgr.writer.root, "mixed")
+
+        # JSON is gone
+        assert list_backups(mgr.writer.root, "mixed") == []
+        # Non-json survived
+        assert rogue.exists()
+        assert rogue.read_text() == "keep me"
+        # Dir still exists because rmdir fails on non-empty
+        assert (BACKUPS_ROOT / wid / "mixed").exists()
+
+        # Cleanup
+        rogue.unlink()
+        (BACKUPS_ROOT / wid / "mixed").rmdir()
+        mgr.release_lock()
+
+    def test_delete_also_purges_pending_staging(self, tmp_path):
+        """Permanently deleting a playlist also cleans pending.json references."""
+        src = tmp_path / "lib"
+        _make_flac(src / "A" / "B" / "01.flac", "A", "Song")
+        dest = tmp_path / "card"
+        dest.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+
+        save_backup(mgr.writer.root, "doomed", "t1",
+                    {"playlist_name": "Doomed", "folder": "Doomed", "tracks": [{"v": 1}]})
+
+        # Simulate staged adds/removes/reorders for this pid
+        from echolist.gui import StagingState, PENDING_FILE
+        staging = StagingState.__new__(StagingState)
+        staging.pending_adds = [
+            {"pid": "doomed", "src": "x.flac", "title": "X", "artist": "A"},
+            {"pid": "keeper", "src": "y.flac", "title": "Y", "artist": "B"},
+        ]
+        staging.pending_removes = [
+            {"pid": "doomed", "index": 1, "copy_name": "01 - X.flac"},
+        ]
+        staging.pending_reorders = {"doomed": [{"key": "c:1"}]}
+
+        # Purge (same logic as _permanently_delete_playlist)
+        staging.pending_adds = [a for a in staging.pending_adds if a["pid"] != "doomed"]
+        staging.pending_removes = [r for r in staging.pending_removes if r["pid"] != "doomed"]
+        staging.pending_reorders.pop("doomed", None)
+
+        assert len(staging.pending_adds) == 1
+        assert staging.pending_adds[0]["pid"] == "keeper"
+        assert staging.pending_removes == []
+        assert "doomed" not in staging.pending_reorders
+        mgr.release_lock()
+
+    def test_workspace_dir_survives_playlist_delete(self, tmp_path):
+        """The workspace-level backup dir is not removed when one playlist is deleted."""
+        src = tmp_path / "lib"
+        _make_flac(src / "A" / "B" / "01.flac", "A", "Song")
+        dest = tmp_path / "card"
+        dest.mkdir()
+        mgr = PlaylistManager.init(src, dest)
+        mgr.create_playlist("Alpha")
+        mgr.add_track("alpha", src / "A" / "B" / "01.flac")
+        mgr.backup_playlist_metadata("alpha", "t1")
+
+        from echolist.config import BACKUPS_ROOT, _workspace_id
+        wid = _workspace_id(mgr.writer.root)
+        wid_dir = BACKUPS_ROOT / wid
+
+        delete_all_backups(mgr.writer.root, "alpha")
+
+        # Playlist dir is gone but workspace dir remains
+        assert not (wid_dir / "alpha").exists()
+        assert wid_dir.exists()
+        mgr.release_lock()

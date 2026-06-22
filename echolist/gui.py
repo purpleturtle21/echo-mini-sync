@@ -110,6 +110,41 @@ def _read_tags_from_file(path: Path) -> tuple[str, str]:
     return path.stem, ""
 
 
+def _resolve_source_file(src_path: str, source_root: Path) -> Path | None:
+    """Try to locate a source file using multiple strategies (read-only).
+
+    Resolution order:
+    1. Relative to source_root (the normal case)
+    2. As an absolute path (if src_path is absolute)
+    3. Just the filename, searched directly under source_root subfolders
+    Returns None if not found anywhere.
+    """
+    if not src_path:
+        return None
+    p = Path(src_path)
+
+    # 1. Relative to source_root
+    if not p.is_absolute():
+        candidate = source_root / p
+        if candidate.exists():
+            return candidate.resolve()
+
+    # 2. Absolute path as-is
+    if p.is_absolute() and p.exists():
+        return p.resolve()
+
+    # 3. Filename search under source_root (handles moved files)
+    name = p.name
+    try:
+        for hit in source_root.rglob(name):
+            if hit.is_file():
+                return hit.resolve()
+    except OSError:
+        pass
+
+    return None
+
+
 def _format_backup_timestamp(ts: str) -> str:
     try:
         dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
@@ -351,7 +386,7 @@ class App:
 
         ttk.Label(frame, text="ECHOLIST", style="Title.TLabel").pack(pady=(0, 20))
 
-        self._setup_status = tk.Label(frame, text="Searching for Echo Mini...",
+        self._setup_status = tk.Label(frame, text="",
                                        font=("Consolas", 10), bg=BG, fg=FG_DIM,
                                        wraplength=350)
         self._setup_status.pack(pady=(0, 10))
@@ -368,16 +403,45 @@ class App:
         self.root.after(200, self._detect_and_show)
 
     def _detect_and_show(self):
+        defaults = load_defaults()
+        saved_source = defaults.get("source", "")
+        saved_dest = defaults.get("dest", "")
         echo_mini = _detect_echo_mini()
+
         for w in self._setup_btn_frame.winfo_children():
             w.destroy()
 
-        if echo_mini:
+        if saved_source and saved_dest:
+            dest_exists = Path(saved_dest).exists()
+            if echo_mini:
+                self._setup_status.config(
+                    text=f"Echo Mini connected at {echo_mini}", fg=GREEN)
+            elif dest_exists:
+                self._setup_status.config(
+                    text=f"Workspace: {saved_dest}", fg=FG)
+            else:
+                self._setup_status.config(
+                    text=f"Saved destination not found:\n{saved_dest}\n\n"
+                         f"Connect your device or change workspace in Settings.",
+                    fg=FG_DIM)
+                btn_row = ttk.Frame(self._setup_btn_frame)
+                btn_row.pack()
+                ttk.Button(btn_row, text="Retry",
+                            command=self._detect_and_show).pack(side="left", padx=5)
+                ttk.Button(btn_row, text="Browse...",
+                            command=self._browse_dest).pack(side="left", padx=5)
+                return
+
+            dest = echo_mini or saved_dest
+            ttk.Button(self._setup_btn_frame, text="[ OPEN ]",
+                        style="Accent.TButton",
+                        command=lambda: self._open_with_dest(dest)).pack(pady=5)
+        elif echo_mini:
             self._setup_status.config(
                 text=f"Echo Mini found at {echo_mini}", fg=GREEN)
             ttk.Button(self._setup_btn_frame, text="[ OPEN ]",
                         style="Accent.TButton",
-                        command=lambda: self._open_with_dest(echo_mini, browse_device=True)).pack(pady=5)
+                        command=lambda: self._open_with_dest(echo_mini)).pack(pady=5)
         else:
             self._setup_status.config(
                 text="Echo Mini not detected.\nConnect your player or choose a folder.",
@@ -405,12 +469,10 @@ class App:
                 return
         self._open_with_dest(d)
 
-    def _open_with_dest(self, dest, browse_device=False):
+    def _open_with_dest(self, dest):
         defaults = load_defaults()
         source = defaults.get("source") or _default_source()
         self._open_workspace(source, dest)
-        if browse_device:
-            self._populate_source_tree(Path(dest))
 
     def _show_settings(self):
         """Unified settings screen — used both for initial setup and in-app config."""
@@ -577,6 +639,10 @@ class App:
 
             if config_file.exists():
                 mgr = PlaylistManager.open(dest, playlist_folder=playlist_folder)
+                resolved_source = str(Path(source).resolve())
+                if mgr.config.source_root != resolved_source:
+                    mgr.config.source_root = resolved_source
+                    mgr.config.save(mgr.writer)
             else:
                 snapshot = PlaylistManager.find_snapshot(dest, playlist_folder=playlist_folder)
                 if snapshot and self._offer_snapshot_restore(snapshot, source, dest):
@@ -695,8 +761,8 @@ class App:
                 src_path = t.get("src_path", "")
                 if not src_path:
                     continue
-                full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
-                if full.exists():
+                full = _resolve_source_file(src_path, source_root)
+                if full:
                     title, artist = _read_tags_from_file(full)
                     self.staging.stage_add(pid, str(full), title, artist)
                 else:
@@ -750,6 +816,22 @@ class App:
         ttk.Label(src_header, text="SOURCE", style="Section.TLabel").pack(side="left")
         ttk.Button(src_header, text="Browse...", command=self._add_files_dialog).pack(side="right")
 
+        # Source search bar
+        self._src_search_var = tk.StringVar()
+        self._src_search_var.trace_add("write", lambda *_: self._on_source_search())
+        src_search_entry = tk.Entry(
+            src_frame, textvariable=self._src_search_var,
+            bg=BG_INPUT, fg=FG, insertbackground=FG,
+            relief="flat", font=("Consolas", 9))
+        src_search_entry.pack(fill="x", padx=4, pady=(0, 2))
+        self._src_search_entry = src_search_entry
+        self._src_search_after_id = None
+        self._src_search_entry.bind("<Escape>", lambda e: self._src_search_clear())
+        self._src_search_entry.bind("<FocusIn>", self._src_search_focus_in)
+        self._src_search_entry.bind("<FocusOut>", self._src_search_focus_out)
+        self._src_search_placeholder = True
+        self._src_search_show_placeholder()
+
         src_tree_frame = ttk.Frame(src_frame)
         src_tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 2))
         self.source_tree = ttk.Treeview(src_tree_frame, selectmode="extended")
@@ -790,14 +872,19 @@ class App:
 
         pl_tree_frame = ttk.Frame(pl_frame)
         pl_tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        self.playlist_tree = ttk.Treeview(pl_tree_frame, columns=("name",), show="tree",
-                                           selectmode="browse")
+        self.playlist_tree = ttk.Treeview(pl_tree_frame, columns=("status", "name"),
+                                           show="tree", selectmode="browse")
         self.playlist_tree.column("#0", width=0, stretch=False)
-        self.playlist_tree.column("name", width=200)
+        self.playlist_tree.column("status", width=20, minwidth=20, stretch=False, anchor="center")
+        self.playlist_tree.column("name", width=180)
         self.playlist_tree.pack(side="left", fill="both", expand=True)
         self.playlist_tree.tag_configure("imported", foreground="#dd8833")
         self.playlist_tree.tag_configure("busy", foreground=FG_DIM)
+        self.playlist_tree.tag_configure("offloaded", foreground=FG_DIM)
+        self.playlist_tree.tag_configure("pending_pl", foreground=PENDING_FG)
+        self.playlist_tree.tag_configure("highlight", foreground=YELLOW)
         self.playlist_tree.bind("<<TreeviewSelect>>", self._on_playlist_select)
+        self.playlist_tree.bind("<Button-3>", self._playlist_context_menu)
 
         self._rename_entry = None
         self._busy_playlists: set[str] = set()
@@ -842,6 +929,10 @@ class App:
         # Track tree tags for pending items
         self.track_tree.tag_configure("pending", foreground=PENDING_FG)
         self.track_tree.tag_configure("removed", foreground="#555555")
+        self.track_tree.tag_configure("offloaded_track", foreground=FG_DIM)
+
+        # Right-click context menu on tracks
+        self.track_tree.bind("<Button-3>", self._track_context_menu)
 
         # Delete/Backspace on track tree removes selected tracks
         self.track_tree.bind("<Delete>", self._remove_track)
@@ -859,6 +950,10 @@ class App:
         self._refresh_expensive_stats()
         self.root.bind("<Control-z>", lambda e: self._do_undo())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        source_root = Path(self.mgr.config.source_root)
+        if source_root.exists():
+            self._populate_source_tree(source_root)
 
     def _build_status_bar(self):
         status_outer = tk.Frame(self.root, bg=BG_PANEL, bd=0)
@@ -999,7 +1094,29 @@ class App:
                         label=f"Restore: {label}",
                         command=lambda p=pid, t=ts: self._restore_deleted(p, t),
                     )
+                sub.add_separator()
+                sub.add_command(
+                    label="Permanently delete",
+                    command=lambda p=pid, n=name: self._permanently_delete_playlist(p, n),
+                )
                 self._playlists_menu.add_cascade(label=f"{name} (deleted)", menu=sub)
+
+    def _permanently_delete_playlist(self, pid: str, name: str):
+        confirm = messagebox.askyesno(
+            "Permanently delete",
+            f"Permanently delete all restore points for '{name}'?\n\n"
+            f"This cannot be undone.",
+        )
+        if not confirm:
+            return
+        from .config import delete_all_backups
+        delete_all_backups(self.mgr.writer.root, pid)
+        # Purge any leftover staged changes for this pid
+        self.staging.pending_adds = [a for a in self.staging.pending_adds if a["pid"] != pid]
+        self.staging.pending_removes = [r for r in self.staging.pending_removes if r["pid"] != pid]
+        self.staging.pending_reorders.pop(pid, None)
+        self.staging.save()
+        self._refresh_playlists_menu()
 
     def _create_restore_point(self, pid: str):
         playlist = self.mgr.store.playlists.get(pid)
@@ -1047,8 +1164,8 @@ class App:
             missing = []
             for s in result["to_stage"]:
                 src_path = s["src_path"]
-                full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
-                if full.exists():
+                full = _resolve_source_file(src_path, source_root)
+                if full:
                     title, artist = _read_tags_from_file(full)
                     self.staging.stage_add(pid, str(full), title, artist)
                 else:
@@ -1093,7 +1210,7 @@ class App:
         if not confirm:
             return
 
-        self.playlist_tree.insert("", "end", iid=pid, values=(name,))
+        self.playlist_tree.insert("", "end", iid=pid, values=("⟳", name))
 
         def restore():
             return self.mgr.restore_deleted_playlist(pid, timestamp)
@@ -1103,8 +1220,8 @@ class App:
             missing = []
             for s in sources:
                 src_path = s["src_path"]
-                full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
-                if full.exists():
+                full = _resolve_source_file(src_path, source_root)
+                if full:
                     title, artist = _read_tags_from_file(full)
                     self.staging.stage_add(pid, str(full), title, artist)
                 else:
@@ -1169,6 +1286,304 @@ class App:
                 self._import_m3u_file(path)
             else:
                 self._stage_add_files([path])
+
+    # ── Source search ──
+
+    def _src_search_show_placeholder(self):
+        self._src_search_placeholder = True
+        self._src_search_entry.config(fg=FG_DIM)
+        self._src_search_var.set("")
+        self._src_search_entry.insert(0, "Search...")
+
+    def _src_search_focus_in(self, event):
+        if self._src_search_placeholder:
+            self._src_search_entry.delete(0, "end")
+            self._src_search_entry.config(fg=FG)
+            self._src_search_placeholder = False
+
+    def _src_search_focus_out(self, event):
+        if not self._src_search_var.get().strip():
+            self._src_search_show_placeholder()
+
+    def _src_search_clear(self):
+        self._src_search_entry.delete(0, "end")
+        self._src_search_show_placeholder()
+        self.root.focus_set()
+        source_root = Path(self.mgr.config.source_root)
+        if source_root.exists():
+            self._populate_source_tree(source_root)
+
+    def _on_source_search(self):
+        if self._src_search_placeholder:
+            return
+        if self._src_search_after_id:
+            self.root.after_cancel(self._src_search_after_id)
+        self._src_search_after_id = self.root.after(150, self._do_source_search)
+
+    def _do_source_search(self):
+        self._src_search_after_id = None
+        query = self._src_search_var.get().strip().lower()
+        if not query:
+            source_root = Path(self.mgr.config.source_root)
+            if source_root.exists():
+                self._populate_source_tree(source_root)
+            return
+        source_root = Path(self.mgr.config.source_root)
+        if not source_root.exists():
+            return
+        self.source_tree.delete(*self.source_tree.get_children())
+        matches = []
+        limit = 200
+        for p in source_root.rglob("*"):
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTS | M3U_EXTS:
+                if query in p.name.lower():
+                    matches.append(p)
+                    if len(matches) >= limit:
+                        break
+        for p in matches:
+            try:
+                rel = p.relative_to(source_root)
+                display = f"{p.name}  ({rel.parent})"
+            except ValueError:
+                display = p.name
+            self.source_tree.insert("", "end", text=display, values=(str(p),))
+
+    # ── Track context menu ──
+
+    def _current_playlist_offloaded(self) -> bool:
+        if not self.current_pid:
+            return False
+        pl = self.mgr.store.playlists.get(self.current_pid)
+        return bool(pl and pl.get("offloaded"))
+
+    def _track_context_menu(self, event):
+        if self._current_playlist_offloaded():
+            return
+        iid = self.track_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.track_tree.selection_set(iid)
+        idx = self.track_tree.index(iid)
+        if idx >= len(self._track_data):
+            return
+        track = self._track_data[idx]
+        src_path = track.get("src_path", "")
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG,
+                       activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        menu.add_command(label="Show in source",
+                         command=lambda: self._show_track_in_source(src_path),
+                         state="normal" if src_path else "disabled")
+        menu.add_command(label="Show in playlists",
+                         command=lambda: self._show_track_in_playlists(src_path),
+                         state="normal" if src_path else "disabled")
+        menu.post(event.x_root, event.y_root)
+
+    def _show_track_in_source(self, src_path: str):
+        if not src_path:
+            return
+        source_root = Path(self.mgr.config.source_root)
+        full = _resolve_source_file(src_path, source_root)
+        if not full:
+            messagebox.showinfo("Not found", f"Source file not found:\n{src_path}")
+            return
+        # Clear any active search
+        if not self._src_search_placeholder:
+            self._src_search_clear()
+        try:
+            rel = full.relative_to(source_root)
+        except ValueError:
+            messagebox.showinfo("Not found", f"File is outside source root:\n{full}")
+            return
+        parts = list(rel.parts)
+        parent_iid = ""
+        for i, part in enumerate(parts):
+            children = self.source_tree.get_children(parent_iid)
+            # Expand lazy placeholder if present
+            if len(children) == 1 and self.source_tree.item(children[0], "text") == "...":
+                self.source_tree.delete(children[0])
+                parent_path = source_root / Path(*parts[:i]) if i > 0 else source_root
+                self._insert_children(parent_iid, parent_path)
+                children = self.source_tree.get_children(parent_iid)
+            # Search for this path component among children
+            found = None
+            for child in children:
+                child_path = Path(self.source_tree.item(child, "values")[0])
+                if child_path.name == part:
+                    found = child
+                    break
+            if not found:
+                # Node not in tree yet — load it from disk
+                node_path = source_root / Path(*parts[:i + 1])
+                if not node_path.exists():
+                    return
+                is_dir = node_path.is_dir()
+                display = part + ("/" if is_dir else "")
+                found = self.source_tree.insert(parent_iid, "end", text=display,
+                                                values=(str(node_path),))
+                if is_dir:
+                    self._insert_children(found, node_path)
+            elif i < len(parts) - 1:
+                self.source_tree.item(found, open=True)
+                sub_children = self.source_tree.get_children(found)
+                if len(sub_children) == 1 and self.source_tree.item(sub_children[0], "text") == "...":
+                    self.source_tree.delete(sub_children[0])
+                    child_path = Path(self.source_tree.item(found, "values")[0])
+                    self._insert_children(found, child_path)
+            parent_iid = found
+        self.source_tree.selection_set(found)
+        self.source_tree.see(found)
+        self.source_tree.focus(found)
+
+    def _show_track_in_playlists(self, src_path: str):
+        if not src_path:
+            return
+        matching_pids = []
+        for pid, pl in self.mgr.store.playlists.items():
+            for t in pl["tracks"]:
+                if t.get("src_path") == src_path:
+                    matching_pids.append(pid)
+                    break
+        if not matching_pids:
+            messagebox.showinfo("Not found", "This track is not in any other playlist.")
+            return
+        for pid in matching_pids:
+            try:
+                self.playlist_tree.item(pid, tags=("highlight",))
+            except Exception:
+                pass
+        self.root.after(2000, lambda: self._clear_playlist_highlight(matching_pids))
+
+    def _clear_playlist_highlight(self, pids: list[str]):
+        for pid in pids:
+            try:
+                pl = self.mgr.store.playlists.get(pid)
+                if pl:
+                    tags = ("offloaded",) if pl.get("offloaded") else ()
+                    self.playlist_tree.item(pid, tags=tags)
+            except Exception:
+                pass
+
+    # ── Playlist context menu (offload/onload) ──
+
+    def _playlist_context_menu(self, event):
+        iid = self.playlist_tree.identify_row(event.y)
+        if not iid or iid.startswith("_imported:"):
+            return
+        self.playlist_tree.selection_set(iid)
+        pl = self.mgr.store.playlists.get(iid)
+        if not pl:
+            return
+
+        is_offloaded = pl.get("offloaded", False)
+        has_pending = self._playlist_has_pending(iid)
+
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG,
+                       activebackground=RED_DARK, activeforeground=FG_BRIGHT)
+        if is_offloaded:
+            menu.add_command(label="Onload (restore to device)",
+                            command=lambda: self._onload_playlist(iid))
+        else:
+            menu.add_command(label="Reindex",
+                            command=lambda: self._reindex_playlist(iid),
+                            state="normal" if pl.get("tracks") and not is_offloaded else "disabled")
+            menu.add_command(label="Offload (remove from device)",
+                            command=lambda: self._offload_playlist(iid),
+                            state="normal" if not has_pending else "disabled")
+        menu.add_separator()
+        menu.add_command(label="Rename", command=lambda: self._start_inline_rename(iid))
+        menu.add_command(label="Delete", command=self._delete_playlist)
+        menu.post(event.x_root, event.y_root)
+
+    def _reindex_playlist(self, pid: str):
+        pl = self.mgr.store.playlists.get(pid)
+        if not pl or not pl.get("tracks"):
+            return
+        order = [{"key": f"c:{t['index']}"} for t in pl["tracks"]]
+        self.staging.set_reorder(pid, order)
+        self._refresh_playlists()
+        self._refresh_tracks()
+        self._update_status()
+
+    def _offload_playlist(self, pid: str):
+        pl = self.mgr.store.playlists.get(pid)
+        if not pl:
+            return
+        name = pl["name"]
+        confirm = messagebox.askyesno(
+            "Offload playlist",
+            f"Offload '{name}'?\n\n"
+            f"This will remove {len(pl['tracks'])} track(s) from the device "
+            f"to free up space. A restore point is saved automatically.\n\n"
+            f"You can onload it back later to re-sync the tracks.",
+        )
+        if not confirm:
+            return
+
+        def offload():
+            self.mgr.backup_playlist_metadata(pid)
+            folder = pl["folder"]
+            try:
+                self.mgr.writer.delete(folder)
+            except Exception:
+                pass
+            pl["tracks"] = []
+            pl["offloaded"] = True
+            self.mgr.store.save()
+
+        def on_done(_):
+            self._refresh_playlists()
+            self._refresh_tracks()
+            self._update_status()
+
+        self._run_playlist_op(pid, name, offload, on_done)
+
+    def _onload_playlist(self, pid: str):
+        pl = self.mgr.store.playlists.get(pid)
+        if not pl:
+            return
+        from .config import load_backup, list_backups
+        backups = list_backups(self.mgr.writer.root, pid)
+        if not backups:
+            messagebox.showerror("No backup", "No restore point found for this playlist.")
+            return
+
+        name = pl["name"]
+
+        def onload():
+            data = load_backup(self.mgr.writer.root, pid, backups[0]["timestamp"])
+            if not data:
+                raise ValueError("Could not load backup data")
+            return data.get("tracks", [])
+
+        def on_done(tracks):
+            pl["offloaded"] = False
+            self.mgr.store.save()
+            source_root = Path(self.mgr.config.source_root)
+            missing = []
+            for entry in tracks:
+                src_path = entry.get("src_path", "")
+                if not src_path:
+                    continue
+                full = _resolve_source_file(src_path, source_root)
+                if full:
+                    title, artist = _read_tags_from_file(full)
+                    self.staging.stage_add(pid, str(full), title, artist)
+                else:
+                    missing.append(src_path)
+            self._refresh_playlists()
+            self._refresh_tracks()
+            self._update_status()
+            staged = len(tracks) - len(missing)
+            parts = []
+            if staged:
+                parts.append(f"Staged {staged} track(s) for syncing.")
+            if missing:
+                parts.append(f"{len(missing)} source file(s) not found.")
+            parts.append("Press Sync to copy tracks back to the device.")
+            messagebox.showinfo("Playlist onloaded", "\n".join(parts))
+
+        self._run_playlist_op(pid, name, onload, on_done)
 
     # ── Drag and drop ──
 
@@ -1277,7 +1692,7 @@ class App:
     # ── Staging operations ──
 
     def _stage_add_files(self, paths: list[Path]):
-        if self._syncing:
+        if self._syncing or self._current_playlist_offloaded():
             return
         if not self.current_pid:
             messagebox.showinfo("No playlist", "Select or create a playlist first.")
@@ -1583,9 +1998,16 @@ class App:
                 _ui(lambda d=done, t=title: _update_progress(d, t))
                 _ui(lambda: _update_file_progress(0))
 
+                copy_done = [False]
+
                 def on_copy_progress(copied, file_total):
                     pct = int(copied / file_total * 100) if file_total else 100
-                    _ui(lambda p=pct: _update_file_progress(p))
+                    if pct >= 100 and not copy_done[0]:
+                        copy_done[0] = True
+                        _ui(lambda d=done, t=title: _update_progress(d, f"Tagging {t}"))
+                        _ui(lambda: _update_file_progress(0))
+                    else:
+                        _ui(lambda p=pct: _update_file_progress(p))
 
                 try:
                     self.mgr.add_track(a["pid"], a["src"], progress_cb=on_copy_progress)
@@ -1657,17 +2079,37 @@ class App:
         self._update_status()
         self._refresh_expensive_stats()
 
+    def _playlist_status_icon(self, pid: str, pl: dict) -> str:
+        if pl.get("offloaded"):
+            return "◌"
+        return "⏏"
+
+    def _playlist_has_pending(self, pid: str) -> bool:
+        return any(
+            a["pid"] == pid for a in self.staging.pending_adds
+        ) or any(
+            r["pid"] == pid for r in self.staging.pending_removes
+        ) or pid in self.staging.pending_reorders
+
     def _refresh_playlists(self):
         self.playlist_tree.delete(*self.playlist_tree.get_children())
         for pid, pl in self.mgr.store.playlists.items():
-            self.playlist_tree.insert("", "end", iid=pid, values=(pl["name"],))
+            icon = self._playlist_status_icon(pid, pl)
+            if pl.get("offloaded"):
+                tags = ("offloaded",)
+            elif self._playlist_has_pending(pid):
+                tags = ("pending_pl",)
+            else:
+                tags = ()
+            self.playlist_tree.insert("", "end", iid=pid, values=(icon, pl["name"]),
+                                      tags=tags)
         self._untracked_playlists = {}
         try:
             for info in self.mgr.detect_untracked_playlists():
                 iid = f"_imported:{info['folder']}"
                 self.playlist_tree.insert(
                     "", "end", iid=iid,
-                    values=(f"{info['folder']} ({info['track_count']} tracks)",),
+                    values=("", f"{info['folder']} ({info['track_count']} tracks)"),
                     tags=("imported",),
                 )
                 self._untracked_playlists[iid] = info
@@ -1687,7 +2129,7 @@ class App:
         """Run a blocking playlist operation in a background thread with spinner."""
         self._busy_playlists.add(pid)
         try:
-            self.playlist_tree.item(pid, values=(f"{display_name} {self._spinner_frames[0]}",),
+            self.playlist_tree.item(pid, values=("⟳", f"{display_name} {self._spinner_frames[0]}"),
                                     tags=("busy",))
         except Exception:
             pass
@@ -1717,7 +2159,13 @@ class App:
                 if pid in [c for c in self.playlist_tree.get_children()]:
                     pl = self.mgr.store.playlists.get(pid)
                     name = pl["name"] if pl else display_name
-                    self.playlist_tree.item(pid, values=(name,), tags=())
+                    icon = self._playlist_status_icon(pid, pl) if pl else "⏏"
+                    tags = ()
+                    if pl and pl.get("offloaded"):
+                        tags = ("offloaded",)
+                    elif pl and self._playlist_has_pending(pid):
+                        tags = ("pending_pl",)
+                    self.playlist_tree.item(pid, values=(icon, name), tags=tags)
             except Exception:
                 pass
             if error:
@@ -1743,9 +2191,9 @@ class App:
         for pid in list(self._busy_playlists):
             try:
                 old = self.playlist_tree.item(pid, "values")
-                if old:
-                    base = old[0].rsplit(" ", 1)[0]
-                    self.playlist_tree.item(pid, values=(f"{base} {frame}",))
+                if old and len(old) >= 2:
+                    base = old[1].rsplit(" ", 1)[0]
+                    self.playlist_tree.item(pid, values=("⟳", f"{base} {frame}"))
             except Exception:
                 pass
         if self._busy_playlists:
@@ -1777,6 +2225,11 @@ class App:
                 self._offer_adopt_playlist(info)
             return
         self.current_pid = selected
+        pl = self.mgr.store.playlists.get(selected)
+        if pl and pl.get("offloaded"):
+            self._show_offloaded_tracks(selected)
+            self.fix_meta_btn.pack_forget()
+            return
         self._refresh_tracks()
         self._check_metadata_sync()
 
@@ -1909,7 +2362,7 @@ class App:
             self.playlist_tree.delete(iid)
         except Exception:
             pass
-        self.playlist_tree.insert("", "end", iid=pid, values=(folder,))
+        self.playlist_tree.insert("", "end", iid=pid, values=("⟳", folder))
 
         def adopt():
             return self.mgr.adopt_playlist(folder)
@@ -2134,6 +2587,28 @@ class App:
 
     # ── Tracks ──
 
+    def _show_offloaded_tracks(self, pid: str):
+        """Display tracks from a backup as grey read-only list for offloaded playlists."""
+        self.track_tree.delete(*self.track_tree.get_children())
+        self._track_data = []
+        self._removed_data = []
+        from .config import list_backups, load_backup
+        backups = list_backups(self.mgr.writer.root, pid)
+        if not backups:
+            self.track_tree.insert("", "end", values=("", "(offloaded — no backup found)", ""),
+                                   tags=("offloaded_track",))
+            return
+        data = load_backup(self.mgr.writer.root, pid, backups[0]["timestamp"])
+        if not data:
+            return
+        for entry in data.get("tracks", []):
+            tags_data = entry.get("tags", {})
+            title = tags_data.get("title", entry.get("copy_name", ""))
+            artist = tags_data.get("artist", "")
+            idx = entry.get("index", "")
+            self.track_tree.insert("", "end", values=(idx, title, artist),
+                                   tags=("offloaded_track",))
+
     def _refresh_tracks(self):
         self.track_tree.delete(*self.track_tree.get_children())
         if not self.current_pid or self.current_pid not in self.mgr.store.playlists:
@@ -2159,6 +2634,7 @@ class App:
                 "artist": artist,
                 "pending": t.get("_pending", False),
                 "copy_name": t.get("copy_name", ""),
+                "src_path": t.get("src_path", ""),
                 "key": t.get("_key", ""),
             })
 
@@ -2226,6 +2702,9 @@ class App:
     # ── Track reorder drag ──
 
     def _trk_drag_start(self, event):
+        if self._current_playlist_offloaded():
+            self._trk_drag_iid = None
+            return
         iid = self.track_tree.identify_row(event.y)
         region = self.track_tree.identify_region(event.x, event.y)
         if region == "heading":
@@ -2325,14 +2804,14 @@ class App:
         # Fallback: read from original source
         if src_path:
             source_root = Path(self.mgr.config.source_root)
-            src_full = source_root / src_path if not Path(src_path).is_absolute() else Path(src_path)
-            if src_full.exists():
+            src_full = _resolve_source_file(src_path, source_root)
+            if src_full:
                 return _read_tags_from_file(src_full)
 
         return copy_name or "", ""
 
     def _remove_track(self, event=None):
-        if self._syncing:
+        if self._syncing or self._current_playlist_offloaded():
             return
         if not self.current_pid:
             return

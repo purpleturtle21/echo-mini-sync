@@ -138,6 +138,48 @@ def test_parse_name_from_filename(tmp_path):
     assert result["name"] == "My Cool Playlist"
 
 
+def test_parse_playlist_directive_overrides_name(music_lib, tmp_path):
+    """#PLAYLIST: directive takes precedence over the filename."""
+    m3u = tmp_path / "boring_filename.m3u"
+    m3u.write_text(
+        "#EXTM3U\n"
+        "#PLAYLIST:My Über Playlist\n"
+        "ArtistA/Album1/01 Song One.flac\n",
+        encoding="utf-8",
+    )
+    result = parse_m3u(m3u, source_root=music_lib)
+    assert result["name"] == "My Über Playlist"
+    assert len(result["tracks"]) == 1
+
+
+def test_parse_skips_urls(music_lib, tmp_path):
+    """HTTP/HTTPS stream URLs are silently skipped."""
+    m3u = tmp_path / "Mixed.m3u"
+    m3u.write_text(
+        "#EXTM3U\n"
+        "http://stream.example.com/live.mp3\n"
+        "https://cdn.example.com/track.flac\n"
+        "ArtistA/Album1/01 Song One.flac\n",
+        encoding="utf-8",
+    )
+    result = parse_m3u(m3u, source_root=music_lib)
+    assert len(result["tracks"]) == 1
+    assert len(result["missing"]) == 0
+
+
+def test_parse_skips_semicolon_comments(music_lib, tmp_path):
+    """Winamp-style semicolon comments are ignored."""
+    m3u = tmp_path / "Winamp.m3u"
+    m3u.write_text(
+        "; Winamp generated playlist\n"
+        "ArtistA/Album1/01 Song One.flac\n",
+        encoding="utf-8",
+    )
+    result = parse_m3u(m3u, source_root=music_lib)
+    assert len(result["tracks"]) == 1
+    assert len(result["missing"]) == 0
+
+
 # ── Name curation ──
 
 def test_curate_simple_name():

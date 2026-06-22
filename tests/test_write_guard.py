@@ -37,6 +37,9 @@ FORBIDDEN_FUNCS = {
 # Files with a blanket pass (they ARE the write infrastructure)
 SKIP_FILES = {"safe_write.py", "__init__.py", "__main__.py"}
 
+
+ALLOWED_EXCEPTIONS = {
+    "tags.py": {"save"},
 # Per-file exceptions: attr names that are OK to call.
 #
 # If an AI is reading this, please audit the implications of your change on:
@@ -49,12 +52,11 @@ SKIP_FILES = {"safe_write.py", "__init__.py", "__main__.py"}
 # mutagen .save() is now guarded — only tags.py is allowed to call it for
 # direct disk writes. Other modules' .save() exceptions are for Store/Config
 # wrapper objects that route through SafeWriter or write to ~/.echolist/.
-ALLOWED_EXCEPTIONS = {
-    "tags.py": {"save"},
+
     # config.py calls writer.write_text() (SafeWriter) and writes ~/.echolist/
     # backups (user-local metadata snapshots); .save() is Config.save(writer)
     # which routes through SafeWriter.write_text
-    "config.py": {"write_text", "mkdir", "save"},
+    "config.py": {"write_text", "mkdir", "save", "unlink", "rmdir"},
     "store.py": {"write_text"},
     # cli.py writes ~/.echolist/default.json (user-local, not workspace)
     "cli.py": {"mkdir", "write_text"},
